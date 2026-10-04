@@ -743,3 +743,28 @@ test("changing the shared webhook requires all devices paused and does not repla
   assert.ok(f.calls.every((call) => JSON.parse(String(call.init.body)).event === "DEVICE_UPDATE"));
   assert.equal(f.store.secrets(f.store.connection(f.id)).signalUrl, undefined);
 });
+
+test("profile name falls back to the live account when Evolution's instance table has no name", async (t) => {
+  let profileJid = "5583999990000@s.whatsapp.net";
+  const f = await fixture(t, async (url, init) => {
+    if (url.includes("fetchInstances"))
+      return Response.json([
+        {
+          name: "number-one",
+          ownerJid: "5583999990000:12@s.whatsapp.net",
+          profileName: null,
+          profilePicUrl: null,
+          connectionStatus: "open",
+        },
+      ]);
+    assert.ok(url.endsWith("/chat/fetchProfile/number-one"));
+    assert.deepEqual(JSON.parse(String(init.body)), { number: "5583999990000" });
+    assert.equal((init.headers as Record<string, string>).apikey, "instance-test-key-only");
+    return Response.json({ wuid: profileJid, name: "Nome do WhatsApp", numberExists: true });
+  });
+  await f.evolution.syncProfile(f.store.connection(f.id));
+  assert.equal(f.store.connection(f.id).profile_name, "Nome do WhatsApp");
+  profileJid = "5583999999999@s.whatsapp.net";
+  await f.evolution.syncProfile(f.store.connection(f.id));
+  assert.equal(f.store.connection(f.id).profile_name, null);
+});

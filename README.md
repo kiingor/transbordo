@@ -71,7 +71,8 @@ referências de conversa, mensagem e mídia e o envia na URL ao responder. A cha
 
 Todos os dispositivos usam o mesmo canal, inclusive os adicionados depois. O catálogo autenticado
 `/platform/devices` permite ao Signal exibir os nomes, números e fotos. Perfis são atualizados a
-cada cinco minutos e também no pareamento ou pelo botão **Sincronizar perfil**. A chave só aparece
+cada cinco minutos e também no pareamento ou pelo botão **Sincronizar perfil**. Se a lista de instâncias
+da Evolution não informar o nome, o portal consulta o perfil do próprio número em `chat/fetchProfile`. A chave só aparece
 para administradores; operadores podem controlar transbordo e contatos.
 
 O Signal não reinicia nem exclui dispositivos externos. QR e pareamento pertencem ao portal.

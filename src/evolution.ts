@@ -138,10 +138,25 @@ export class Evolution {
       );
     if (!entry) throw new AppError(404, "EVOLUTION_PROFILE_NOT_FOUND");
     const profile = { ...object(entry.instance), ...entry };
-    const profileName =
+    let profileName =
       (string(profile.profileName) || string(profile.profile_name)).slice(0, 200) || null;
     const jid = normalizeJid(string(profile.ownerJid) || string(profile.owner));
     const number = /^\d+@s\.whatsapp\.net$/.test(jid) ? jid.split("@")[0]! : c.number;
+    // Evolution 2.3.7 can keep profileName null in its instance table after pairing.
+    // The live profile endpoint still exposes the WhatsApp account's current name.
+    if (!profileName && number && !this.stopping) {
+      try {
+        const detail = object(
+          await this.json(c, `chat/fetchProfile/${encodeURIComponent(c.instance)}`, "POST", {
+            number,
+          }),
+        );
+        if (normalizeJid(string(detail.wuid)) === normalizeJid(number))
+          profileName = string(detail.name).slice(0, 200) || null;
+      } catch {
+        /* An unavailable live profile must not block state and photo updates. */
+      }
+    }
     const rawPicture = string(profile.profilePicUrl) || string(profile.profilePictureUrl);
     let picture: string | null = null;
     try {
