@@ -1,0 +1,29 @@
+name: softcom-transbordo
+services:
+  portal:
+    build:
+      context: ..
+    restart: unless-stopped
+    env_file: ../.env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3080
+      DATABASE_PATH: /app/data/portal.sqlite
+    ports:
+      - "127.0.0.1:3080:3080"
+    volumes:
+      - portal-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  portal-data:

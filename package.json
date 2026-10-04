@@ -1,0 +1,39 @@
+{
+  "name": "softcom-transbordo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.server.json && node build.mjs",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "start": "node --env-file-if-exists=.env dist/server/server.js",
+    "dev": "node build.mjs && node --env-file-if-exists=.env --import tsx --watch src/server.ts",
+    "test": "node --import tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build",
+    "bootstrap": "node --env-file-if-exists=.env --import tsx src/bootstrap.ts",
+    "test:browser": "npm run build && node --import tsx test/browser.ts",
+    "format": "biome format --write ."
+  },
+  "dependencies": {
+    "@fastify/helmet": "13.1.0",
+    "@fastify/rate-limit": "11.1.0",
+    "fastify": "5.12.5",
+    "lucide-react": "1.24.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.3",
+    "@playwright/test": "1.63.0",
+    "@types/node": "26.1.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "esbuild": "0.28.1",
+    "tsx": "4.23.0",
+    "typescript": "5.9.3"
+  }
+}

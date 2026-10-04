@@ -1,0 +1,6 @@
+# Substitua pelo domínio apontado para a VPS. Use o proxy já existente se houver.
+transbordo.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:3080
+    # Não habilite access logs com URLs completas: webhooks possuem segredo no caminho.
+}
