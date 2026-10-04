@@ -14,6 +14,7 @@ O repositório e o banco são próprios. Não há acesso direto ao banco do Sign
 - Recebimento autenticado, fila persistente, deduplicação e tentativas de entrega ao Signal.
 - Retorno das respostas por uma API compatível com Evolution, com uma chave da plataforma e roteamento pelo dispositivo de origem.
 - Histórico de entregas e alterações, sem exibir conteúdo de mensagens ou chaves.
+- Remoção de dispositivos por administradores, com confirmação, pausa e cancelamento da fila.
 
 ## Executar localmente
 
@@ -78,6 +79,21 @@ para administradores; operadores podem controlar transbordo e contatos.
 O Signal não reinicia nem exclui dispositivos externos. QR e pareamento pertencem ao portal.
 O portal permite apenas operações necessárias ao transporte. Envios sem dispositivo são recusados;
 o envio de teste do Signal oferece uma seleção explícita do aparelho.
+
+### Remover um dispositivo
+
+Em **Gerenciar dispositivo → Dispositivo e perfil → Remover dispositivo**, o administrador
+confirma a remoção. O transbordo é pausado, pendências são canceladas e as requisições já
+iniciadas terminam antes da exclusão. Contatos, exceções, foto e histórico local daquele
+dispositivo são excluídos; auditoria, outros dispositivos, canal da plataforma e conversas
+existentes no Signal são preservados.
+
+Instâncias criadas pelo portal são removidas da Evolution com a chave do próprio dispositivo.
+A [Evolution 2.3.7](https://github.com/EvolutionAPI/evolution-api/blob/2.3.7/src/api/controllers/instance.controller.ts)
+encerra a sessão WhatsApp ao excluir uma instância conectada. Instâncias importadas permanecem
+na Evolution; somente o webhook pertencente a este portal é desativado. Um webhook alterado
+por outra integração é preservado. Se a Evolution falhar, o dispositivo continua cadastrado e
+pausado para permitir nova tentativa. Instância já ausente (404) não impede a limpeza local.
 
 ### Atualização de uma instalação anterior
 

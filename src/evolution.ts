@@ -21,12 +21,32 @@ export function transport(config: Config): Transport {
     });
 }
 export class Evolution {
+  private requests = new Map<string, Set<Promise<Response>>>();
   constructor(
     readonly config: Config,
     readonly store: Store,
     readonly fetcher: Transport = transport(config),
   ) {}
   async request(
+    c: Connection,
+    path: string,
+    method = "GET",
+    body?: unknown,
+    global = false,
+  ): Promise<Response> {
+    this.store.connection(c.id);
+    const pending = this.rawRequest(c, path, method, body, global);
+    const requests = this.requests.get(c.id) ?? new Set<Promise<Response>>();
+    this.requests.set(c.id, requests);
+    requests.add(pending);
+    try {
+      return await pending;
+    } finally {
+      requests.delete(pending);
+      if (!requests.size) this.requests.delete(c.id);
+    }
+  }
+  private async rawRequest(
     c: Connection,
     path: string,
     method = "GET",
@@ -42,6 +62,33 @@ export class Evolution {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       redirect: "manual",
     });
+  }
+  async remove(c: Connection) {
+    // beginRemoval blocks new operations. Let already-started provider requests settle
+    // before removing their instance; a concurrent connect cannot recreate it afterward.
+    await Promise.allSettled(this.requests.get(c.id) ?? []);
+    const instance = encodeURIComponent(c.instance);
+    const checked = async (response: Response) => {
+      if (response.status === 404) return null;
+      if (!response.ok) throw new AppError(502, "EVOLUTION_REMOVE_FAILED");
+      const payload = object(await response.json());
+      if (payload.error === true) throw new AppError(502, "EVOLUTION_REMOVE_FAILED");
+      return payload;
+    };
+    if (c.managed) {
+      // Evolution 2.3.7 delete also logs out a connected WhatsApp session.
+      await checked(await this.rawRequest(c, `instance/delete/${instance}`, "DELETE"));
+    } else {
+      // Imported instances may serve another integration. Disable only our own webhook.
+      const payload = await checked(await this.rawRequest(c, `webhook/find/${instance}`));
+      const webhook = object(payload?.webhook ?? payload);
+      if (webhook.url === this.webhook(c).url)
+        await checked(
+          await this.rawRequest(c, `webhook/set/${instance}`, "POST", {
+            webhook: { ...this.webhook(c), enabled: false },
+          }),
+        );
+    }
   }
   async json(
     c: Connection,
@@ -109,6 +156,7 @@ export class Evolution {
     await this.json(c, `webhook/set/${encodeURIComponent(c.instance)}`, "POST", {
       webhook: this.webhook(c),
     });
+    this.store.connection(c.id);
     this.store.db.prepare("UPDATE connections SET webhook_configured=1 WHERE id=?").run(c.id);
     return this.pair(c);
   }
@@ -117,6 +165,7 @@ export class Evolution {
       await this.json(c, `instance/connectionState/${encodeURIComponent(c.instance)}`),
     );
     const state = string(object(payload.instance).state) || string(payload.state) || "close";
+    this.store.connection(c.id);
     this.store.db.prepare("UPDATE connections SET state=? WHERE id=?").run(state, c.id);
     await this.syncProfile(this.store.connection(c.id)).catch(() => undefined);
     return { state };
@@ -188,6 +237,7 @@ export class Evolution {
     }
     const state = string(profile.connectionStatus) || c.state;
     this.store.transaction(() => {
+      this.store.connection(c.id);
       this.store.db
         .prepare(`UPDATE connections SET profile_name=?,number=?,profile_picture_url=?,
         profile_photo=?,profile_photo_type=?,profile_synced_at=?,state=? WHERE id=?`)
@@ -219,7 +269,11 @@ export class Evolution {
         .all(Date.now() - 5 * 60_000);
       for (const device of devices) {
         if (this.stopping) break;
-        await this.syncProfile(this.store.connection(String(device.id))).catch(() => undefined);
+        try {
+          await this.syncProfile(this.store.connection(String(device.id)));
+        } catch {
+          // A device may be removed while its profile refresh is in progress.
+        }
       }
     } finally {
       this.refreshingProfiles = false;
@@ -245,6 +299,7 @@ export class Evolution {
     if (!Array.isArray(rows)) throw new AppError(502, "EVOLUTION_INVALID_CONTACTS");
     if (rows.length > 100_000) throw new AppError(413, "CONTACT_LIMIT_EXCEEDED");
     this.store.transaction(() => {
+      this.store.connection(c.id);
       syncContacts(this.store, c.id, rows);
       this.store.db.prepare("UPDATE connections SET last_sync=? WHERE id=?").run(Date.now(), c.id);
     });

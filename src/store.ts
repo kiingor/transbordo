@@ -71,6 +71,7 @@ export interface Delivery {
 export class Store {
   readonly db: DatabaseSync;
   readonly vault: Vault;
+  private removing = new Set<string>();
   constructor(path: string, key: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
@@ -192,6 +193,13 @@ export class Store {
   deviceEnvelope(c: Connection) {
     return { platformId: this.platform().id, device: this.deviceProfile(c) };
   }
+  listDeviceProfiles() {
+    return this.db
+      .prepare("SELECT id FROM connections ORDER BY created_at")
+      .all()
+      .filter((row) => !this.removing.has(String(row.id)))
+      .map((row) => this.deviceProfile(this.connection(String(row.id))));
+  }
   queueDeviceUpdate(id: string) {
     const p = this.platform();
     if (!p.signalUrl) return;
@@ -226,7 +234,36 @@ export class Store {
       | Connection
       | undefined;
     if (!row) throw new AppError(404, "CONNECTION_NOT_FOUND");
+    if (this.removing.has(id)) throw new AppError(409, "DEVICE_REMOVING");
     return row;
+  }
+  beginRemoval(id: string, actor: string): Connection {
+    const c = this.connection(id);
+    this.transaction(() => {
+      this.setOverflow(id, false, actor);
+      this.db
+        .prepare(`UPDATE deliveries SET status='ignored',payload=NULL,last_error='DEVICE_REMOVED'
+          WHERE connection_id=? AND status='pending'`)
+        .run(id);
+      this.db
+        .prepare(
+          "UPDATE deliveries SET last_error='DEVICE_REMOVED' WHERE connection_id=? AND status='processing'",
+        )
+        .run(id);
+    });
+    this.removing.add(id);
+    return c;
+  }
+  endRemoval(id: string) {
+    this.removing.delete(id);
+  }
+  deleteConnection(id: string, actor: string) {
+    if (!this.removing.has(id)) throw new AppError(409, "REMOVAL_NOT_STARTED");
+    this.transaction(() => {
+      // Foreign keys remove only this device's contacts, aliases and delivery queue.
+      this.db.prepare("DELETE FROM connections WHERE id=?").run(id);
+      this.audit(actor, "connection.removed", id);
+    });
   }
   secrets(c: Connection): Secrets {
     return this.vault.open(c.secrets, c.id);
@@ -396,7 +433,7 @@ export class Store {
     const current = this.db.prepare("SELECT last_error FROM deliveries WHERE id=?").get(id);
     if (
       status !== "delivered" &&
-      ["OVERFLOW_DISABLED", "CONTACT_IGNORED", "DESTINATION_CHANGED"].includes(
+      ["OVERFLOW_DISABLED", "CONTACT_IGNORED", "DESTINATION_CHANGED", "DEVICE_REMOVED"].includes(
         String(current?.last_error),
       )
     ) {

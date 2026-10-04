@@ -33,6 +33,10 @@ const { app, dispatcher } = await buildApp(config, {
   transport: async (url, init) => {
     upstream.push(url);
     const instance = url.split("/").at(-1)!;
+    if (url.includes("/instance/delete/") && init.method === "DELETE") {
+      provisioned.delete(instance);
+      return Response.json({ status: "SUCCESS", error: false });
+    }
     if (url.endsWith("/instance/create")) {
       provisioned.add(JSON.parse(String(init.body)).instanceName);
       return Response.json({ instance: { state: "connecting" } });
@@ -105,10 +109,10 @@ page.on("console", (e) => {
     failures.push(e.text());
 });
 const shots = process.env.PORTAL_SCREENSHOTS;
-async function screenshot(name: string) {
+async function screenshot(name: string, fullPage = true) {
   if (!shots) return;
   await mkdir(shots, { recursive: true });
-  await page.screenshot({ path: resolve(shots, name), fullPage: true });
+  await page.screenshot({ path: resolve(shots, name), fullPage });
 }
 try {
   await page.goto(config.PUBLIC_URL);
@@ -198,8 +202,46 @@ try {
     page.getByRole("switch", { name: "Ativar transbordo", exact: true }),
   ).toHaveAttribute("aria-checked", "true");
   await dispatcher.tick();
-  await page.getByRole("button", { name: "Todos os dispositivos" }).click();
+  const added = store.db
+    .prepare("SELECT id,instance FROM connections WHERE name=?")
+    .get("Novo número de teste")!;
+  const platformBeforeRemoval = store.platform();
+  await page.getByRole("button", { name: "Remover dispositivo", exact: true }).click();
+  const removal = page.getByRole("dialog", { name: "Remover este dispositivo?" });
+  await expect(removal).toBeVisible();
+  await expect(removal.getByText("Perfil sincronizado", { exact: true })).toBeVisible();
+  await expect(
+    removal.getByText(/As conversas já recebidas no Signal serão mantidas/),
+  ).toBeVisible();
+  await removal.getByRole("button", { name: "Cancelar", exact: true }).click();
+  await expect(removal).toHaveCount(0);
+  if (!store.db.prepare("SELECT 1 FROM connections WHERE id=?").get(String(added.id)))
+    throw new Error("Cancel removed the device");
+  await page.getByRole("button", { name: "Remover dispositivo", exact: true }).click();
+  await screenshot("remove-device-desktop.png", false);
   await page.setViewportSize({ width: 390, height: 844 });
+  await screenshot("remove-device-mobile.png", false);
+  if (
+    !(await removal.evaluate((dialog) => {
+      const box = dialog.getBoundingClientRect();
+      return box.top >= 0 && box.bottom <= innerHeight && box.right <= innerWidth;
+    }))
+  )
+    throw new Error("Removal dialog does not fit the mobile screen");
+  if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth))
+    throw new Error("Removal modal overflows viewport");
+  await removal.getByRole("button", { name: "Confirmar remoção", exact: true }).click();
+  await expect(
+    page.getByText("Dispositivo removido. A conexão da plataforma com o Signal foi mantida."),
+  ).toBeVisible();
+  await expect(page.locator(".connection-card")).toHaveCount(3);
+  if (provisioned.has(String(added.instance)))
+    throw new Error("Managed Evolution instance was not removed");
+  if (JSON.stringify(store.platform()) !== JSON.stringify(platformBeforeRemoval))
+    throw new Error("Removing a device changed the platform");
+  await expect(
+    page.getByRole("switch", { name: "Transbordo de Suporte técnico", exact: true }),
+  ).toHaveAttribute("aria-checked", "true");
   await screenshot("mobile.png");
   if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth))
     throw new Error("Mobile layout overflows viewport");
@@ -216,9 +258,23 @@ try {
   await expect(page.getByText("Operador de teste", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Sair", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Bem-vindo de volta" })).toBeVisible();
+  await page.getByLabel("E-mail", { exact: true }).fill("operator@example.test");
+  await page.getByLabel("Senha", { exact: true }).fill("operator-test-password");
+  await page.getByRole("button", { name: "Entrar no portal" }).click();
+  await page
+    .locator(".connection-card")
+    .first()
+    .getByRole("button", { name: "Gerenciar dispositivo" })
+    .click();
+  await expect(page.getByRole("heading", { name: "Quem pode chegar ao Signal?" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Dispositivo e perfil" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Remover dispositivo", exact: true })).toHaveCount(
+    0,
+  );
+  await page.getByRole("button", { name: "Sair", exact: true }).click();
   if (failures.length) throw new Error(failures.join("\n"));
   console.log(
-    "Browser checks passed: login, shared platform setup, device isolation, pause, contacts, profile/photo sync, new device, mobile layout, team and logout.",
+    "Browser checks passed: login, shared platform setup, device isolation, pause, contacts, profile/photo sync, new device, removal/cancel, operator restrictions, mobile layout, team and logout.",
   );
   console.log(`Simulated upstream calls: ${upstream.length}. No real messages sent.`);
 } finally {

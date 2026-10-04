@@ -105,7 +105,8 @@ button {
   font-weight: 600;
 }
 .primary,
-.secondary {
+.secondary,
+.danger {
   padding: 11px 16px;
   border-radius: 8px;
   min-height: 40px;
@@ -125,6 +126,13 @@ button {
 }
 .secondary:hover {
   background: #f5f7f8;
+}
+.danger {
+  background: #b13d3d;
+  color: #fff;
+}
+.danger:hover {
+  background: #963333;
 }
 .full {
   width: 100%;
@@ -950,6 +958,13 @@ footer span {
   display: grid;
   grid-template-columns: 1fr 1.2fr;
   gap: 22px;
+}
+.remove-device {
+  grid-column: 1 / -1;
+  border-color: #eed4d4;
+}
+.remove-device h2 {
+  color: #963333;
 }
 .step {
   width: 23px;

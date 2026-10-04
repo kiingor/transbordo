@@ -290,6 +290,21 @@ export async function buildApp(
         return { ok: true };
       },
     );
+    api.delete<{ Params: { id: string } }>("/api/connections/:id", async (request) => {
+      const user = admin(request);
+      const c = store.beginRemoval(request.params.id, user.id);
+      try {
+        await dispatcher.waitForDevice(c.id);
+        await evolution.remove(c);
+        store.deleteConnection(c.id, user.id);
+        return { ok: true };
+      } catch {
+        store.audit(user.id, "connection.removal_failed", c.id);
+        throw new AppError(502, "EVOLUTION_REMOVE_FAILED");
+      } finally {
+        store.endRemoval(c.id);
+      }
+    });
     api.get<{ Params: { id: string } }>("/api/connections/:id/integration", async (request) => {
       admin(request);
       return integration(request.params.id);
@@ -394,10 +409,7 @@ export async function buildApp(
   }
   app.get("/platform/devices", { onRequest: platformAuth }, async () => ({
     platformId: store.platform().id,
-    devices: store.db
-      .prepare("SELECT id FROM connections ORDER BY created_at")
-      .all()
-      .map((row) => store.deviceProfile(store.connection(String(row.id)))),
+    devices: store.listDeviceProfiles(),
   }));
   app.post("/platform/webhook", { onRequest: platformAuth, bodyLimit: 8192 }, async (request) => {
     const body = z

@@ -183,6 +183,249 @@ test("login requires same origin, isolates admin operations and never exposes cr
   assert.match(operator.headers["set-cookie"] as string, /SameSite=Strict/);
 });
 
+test("device removal requires an administrator and the portal origin", async (t) => {
+  const f = await fixture(t);
+  const url = `/api/connections/${f.id}`;
+  assert.equal((await f.app.inject({ method: "DELETE", url })).statusCode, 403);
+  assert.equal(
+    (await f.app.inject({ method: "DELETE", url, headers: { origin: config.PUBLIC_URL } }))
+      .statusCode,
+    401,
+  );
+  assert.equal(
+    (
+      await f.app.inject({
+        method: "DELETE",
+        url,
+        headers: { ...f.headers, origin: "https://other.test" },
+      })
+    ).statusCode,
+    403,
+  );
+  const login = await f.app.inject({
+    method: "POST",
+    url: "/api/login",
+    headers: { origin: config.PUBLIC_URL },
+    payload: { email: "operator@example.test", password },
+  });
+  const cookie = login.cookies[0]!;
+  assert.equal(
+    (
+      await f.app.inject({
+        method: "DELETE",
+        url,
+        headers: { ...f.headers, cookie: `${cookie.name}=${cookie.value}` },
+      })
+    ).statusCode,
+    403,
+  );
+  assert.equal(f.store.connection(f.id).name, "Atendimento");
+  assert.equal(f.calls.length, 0);
+});
+
+test("removing a managed device deletes only its data and preserves the platform and other devices", async (t) => {
+  const f = await fixture(t);
+  f.store.db.prepare("UPDATE connections SET managed=1 WHERE id=?").run(f.id);
+  const other = f.store.createConnection({ name: "Other device" }).connection;
+  f.store.setPlatformWebhook(signalUrl, "admin");
+  const platform = f.store.platform();
+  for (const id of [f.id, other.id]) {
+    f.store.upsertContact(id, "558399991111@s.whatsapp.net", "Test", "558399991111");
+    f.store.linkAlias(id, "100000000@lid", "558399991111@s.whatsapp.net");
+  }
+  f.store.setOverflow(f.id, true, "admin");
+  await f.app.inject({ method: "POST", url: f.hook, payload: f.inbound("pending-removal") });
+  const result = await f.app.inject({
+    method: "DELETE",
+    url: `/api/connections/${f.id}`,
+    headers: f.headers,
+  });
+  assert.equal(result.statusCode, 200, result.body);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0]?.url, `${config.EVOLUTION_URL}/instance/delete/number-one`);
+  assert.equal(f.calls[0]?.init.method, "DELETE");
+  assert.equal(new Headers(f.calls[0]?.init.headers).get("apikey"), "instance-test-key-only");
+  for (const table of ["contacts", "aliases", "deliveries"])
+    assert.equal(
+      f.store.db.prepare(`SELECT count(*) AS n FROM ${table} WHERE connection_id=?`).get(f.id)?.n,
+      0,
+    );
+  assert.deepEqual(f.store.platform(), platform);
+  assert.equal(
+    f.store.db.prepare("SELECT count(*) AS n FROM contacts WHERE connection_id=?").get(other.id)?.n,
+    1,
+  );
+  assert.equal(f.store.connection(other.id).name, "Other device");
+  const catalog = await f.app.inject({
+    url: "/platform/devices",
+    headers: { apikey: platform.apiKey },
+  });
+  assert.deepEqual(
+    catalog.json().devices.map((d: { id: string }) => d.id),
+    [other.id],
+  );
+  assert.equal(
+    (await f.app.inject({ method: "POST", url: f.hook, payload: f.inbound("late-hook") }))
+      .statusCode,
+    401,
+  );
+  assert.equal(
+    (
+      await f.app.inject({
+        method: "POST",
+        url: `/platform/message/sendText/${f.id}`,
+        headers: { apikey: platform.apiKey },
+        payload: { number: "558399991111", text: "test" },
+      })
+    ).statusCode,
+    404,
+  );
+  assert.equal(
+    (await f.app.inject({ method: "DELETE", url: `/api/connections/${f.id}`, headers: f.headers }))
+      .statusCode,
+    404,
+  );
+  assert.equal(
+    f.store.db
+      .prepare("SELECT actor FROM audit WHERE action='connection.removed' AND connection_id=?")
+      .get(f.id)?.actor,
+    "admin",
+  );
+  assert.equal(f.calls.length, 1);
+});
+
+test("failed removal keeps a paused device for retry; a missing remote instance permits cleanup", async (t) => {
+  let status = 503;
+  const f = await fixture(t, async () => new Response("{}", { status }));
+  f.store.db.prepare("UPDATE connections SET managed=1 WHERE id=?").run(f.id);
+  f.store.setOverflow(f.id, true, "admin");
+  await f.app.inject({ method: "POST", url: f.hook, payload: f.inbound("cancel-on-removal") });
+  const result = await f.app.inject({
+    method: "DELETE",
+    url: `/api/connections/${f.id}`,
+    headers: f.headers,
+  });
+  assert.equal(result.statusCode, 502);
+  assert.equal(result.json().error, "EVOLUTION_REMOVE_FAILED");
+  assert.equal(f.store.connection(f.id).overflow, 0);
+  assert.equal(
+    f.store.db.prepare("SELECT count(*) AS n FROM contacts WHERE connection_id=?").get(f.id)?.n,
+    1,
+  );
+  assert.equal(f.store.db.prepare("SELECT status FROM deliveries").get()?.status, "ignored");
+  assert.equal(f.store.db.prepare("SELECT payload FROM deliveries").get()?.payload, null);
+  await f.dispatcher.tick();
+  assert.equal(f.calls.length, 1);
+  status = 404;
+  assert.equal(
+    (await f.app.inject({ method: "DELETE", url: `/api/connections/${f.id}`, headers: f.headers }))
+      .statusCode,
+    200,
+  );
+  assert.throws(() => f.store.connection(f.id), /CONNECTION_NOT_FOUND/);
+});
+
+test("imported device removal disables only a webhook still owned by this portal", async (t) => {
+  for (const owned of [true, false])
+    await t.test(owned ? "portal webhook" : "another integration", async (t) => {
+      let webhookUrl = "https://another.example.test/hook";
+      const f = await fixture(t, async (url) =>
+        url.includes("webhook/find")
+          ? Response.json({ url: webhookUrl })
+          : Response.json({ enabled: false }),
+      );
+      if (owned) webhookUrl = `${config.PUBLIC_URL}${f.hook}`;
+      const result = await f.app.inject({
+        method: "DELETE",
+        url: `/api/connections/${f.id}`,
+        headers: f.headers,
+      });
+      assert.equal(result.statusCode, 200, result.body);
+      assert.equal(f.calls.length, owned ? 2 : 1);
+      assert.ok(f.calls.every((call) => call.init.method !== "DELETE"));
+      if (owned) {
+        const body = JSON.parse(String(f.calls[1]?.init.body));
+        assert.equal(body.webhook.enabled, false);
+        assert.equal(body.webhook.url, webhookUrl);
+      }
+    });
+});
+
+test("removal waits for an in-flight connect and prevents recreating the instance", async (t) => {
+  const started = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<Response>();
+  const f = await fixture(t, async (url) => {
+    if (url.includes("connectionState")) {
+      started.resolve();
+      return response.promise;
+    }
+    return Response.json({ status: "SUCCESS", error: false });
+  });
+  f.store.db.prepare("UPDATE connections SET managed=1 WHERE id=?").run(f.id);
+  const connecting = f.app
+    .inject({ method: "POST", url: `/api/connections/${f.id}/connect`, headers: f.headers })
+    .then((r) => r);
+  await started.promise;
+  const deleting = f.app
+    .inject({ method: "DELETE", url: `/api/connections/${f.id}`, headers: f.headers })
+    .then((r) => r);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    (
+      await f.app.inject({
+        method: "POST",
+        url: `/api/connections/${f.id}/connect`,
+        headers: f.headers,
+      })
+    ).statusCode,
+    409,
+  );
+  assert.equal(f.calls.length, 1);
+  response.resolve(new Response("{}", { status: 404 }));
+  assert.equal((await connecting).statusCode, 409);
+  assert.equal((await deleting).statusCode, 200);
+  assert.equal(f.calls.length, 2);
+  assert.ok(f.calls.every((call) => !call.url.endsWith("/instance/create")));
+});
+
+test("removal drains an in-flight Signal delivery and cancels its retry", async (t) => {
+  const started = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<Response>();
+  const f = await fixture(t, async (url) => {
+    if (url === signalUrl) {
+      started.resolve();
+      return response.promise;
+    }
+    return Response.json({ status: "SUCCESS", error: false });
+  });
+  f.store.db.prepare("UPDATE connections SET managed=1 WHERE id=?").run(f.id);
+  f.store.setOverflow(f.id, true, "admin");
+  await f.app.inject({ method: "POST", url: f.hook, payload: f.inbound("in-flight-removal") });
+  const dispatch = f.dispatcher.tick();
+  await started.promise;
+  const deleting = f.app
+    .inject({ method: "DELETE", url: `/api/connections/${f.id}`, headers: f.headers })
+    .then((r) => r);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(f.calls.length, 1);
+  assert.equal(
+    (
+      await f.app.inject({
+        method: "PATCH",
+        url: `/api/connections/${f.id}`,
+        headers: f.headers,
+        payload: { overflow: true },
+      })
+    ).statusCode,
+    409,
+  );
+  response.resolve(new Response("{}", { status: 503 }));
+  await dispatch;
+  assert.equal((await deleting).statusCode, 200);
+  assert.equal(f.calls.length, 2);
+  assert.equal(await f.dispatcher.tick(), false);
+});
+
 test("paused messages are acknowledged, deduplicated and never replayed on activation", async (t) => {
   const f = await fixture(t);
   assert.equal(

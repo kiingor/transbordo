@@ -137,6 +137,7 @@ export function receive(store: Store, c: Connection, input: unknown) {
 export class Dispatcher {
   private running = false;
   private stopped = false;
+  private activeDevice: string | undefined;
   constructor(
     private store: Store,
     private config: Config,
@@ -149,6 +150,7 @@ export class Dispatcher {
       const job = this.store.claim();
       if (!job) return false;
       const c = this.store.connection(job.connection_id);
+      this.activeDevice = c.id;
       if (
         !job.payload ||
         job.last_error === "DESTINATION_CHANGED" ||
@@ -203,6 +205,7 @@ export class Dispatcher {
       );
       return true;
     } finally {
+      this.activeDevice = undefined;
       this.running = false;
     }
   }
@@ -210,6 +213,9 @@ export class Dispatcher {
   async stop(): Promise<void> {
     this.stopped = true;
     while (this.running) await delay(25);
+  }
+  async waitForDevice(id: string): Promise<void> {
+    while (this.activeDevice === id) await delay(25);
   }
 }
 

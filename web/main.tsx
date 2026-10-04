@@ -32,6 +32,7 @@ import {
   Settings2,
   ShieldCheck,
   Smartphone,
+  Trash2,
   Users,
   X,
 } from "lucide-react";
@@ -105,6 +106,10 @@ const errors: Record<string, string> = {
   TOO_MANY_REQUESTS: "Muitas tentativas. Aguarde um minuto e tente novamente.",
   ADMIN_REQUIRED: "Essa configuração requer um administrador.",
   CANNOT_DISABLE_SELF: "Você não pode desativar seu próprio acesso.",
+  DEVICE_REMOVING: "Este dispositivo está sendo removido. Aguarde a conclusão.",
+  CONNECTION_NOT_FOUND: "Este dispositivo já foi removido. Volte à lista de dispositivos.",
+  EVOLUTION_REMOVE_FAILED:
+    "Não foi possível concluir a remoção na Evolution. O transbordo ficou pausado; tente remover novamente.",
 };
 async function api<T>(path: string, body?: unknown, method?: string): Promise<T> {
   const response = await fetch(`/api${path}`, {
@@ -209,10 +214,12 @@ function Modal({
   title,
   children,
   close,
+  busy = false,
 }: {
   title: string;
   children: ReactNode;
   close: () => void;
+  busy?: boolean;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const error = useContext(FeedbackContext);
@@ -220,10 +227,18 @@ function Modal({
     dialog.current?.showModal();
   }, []);
   return (
-    <dialog ref={dialog} className="modal" onCancel={close}>
+    <dialog
+      ref={dialog}
+      className="modal"
+      aria-label={title}
+      onCancel={(event) => {
+        if (busy) event.preventDefault();
+        else close();
+      }}
+    >
       <header>
         <h2>{title}</h2>
-        <button className="icon-button" aria-label="Fechar" onClick={close}>
+        <button className="icon-button" aria-label="Fechar" onClick={close} disabled={busy}>
           <X size={20} />
         </button>
       </header>
@@ -381,6 +396,7 @@ function App() {
       setUser(null);
       setIntegration(null);
       setSelected(null);
+      setTab("connections");
     };
     window.addEventListener("session-expired", expired);
     api<{ user: User; setup: Setup }>("/me")
@@ -410,6 +426,7 @@ function App() {
       await refresh();
       if (message) setNotice({ error: false, text: message });
     } catch (e) {
+      await refresh().catch(() => {});
       setNotice({ error: true, text: (e as Error).message });
     } finally {
       setBusy("");
@@ -482,6 +499,8 @@ function App() {
                   await api("/logout", {});
                   setUser(null);
                   setIntegration(null);
+                  setSelected(null);
+                  setTab("connections");
                 })
               }
             >
@@ -980,9 +999,11 @@ function ConnectionDetail({
   back: () => void;
 }) {
   const [tab, setTab] = useState("contacts"),
-    [qr, setQr] = useState<string | null>(null);
+    [qr, setQr] = useState<string | null>(null),
+    [removeOpen, setRemoveOpen] = useState(false);
   useEffect(() => {
     setQr(null);
+    setRemoveOpen(false);
     setTab(c.webhook_configured || user.role !== "admin" ? "contacts" : "setup");
   }, [c.id]);
   useEffect(() => {
@@ -1122,7 +1143,66 @@ function ConnectionDetail({
               <p>Este dispositivo usa a conexão única da plataforma com o Signal.</p>
             </div>
           </section>
+          <section className="panel remove-device">
+            <h2>
+              <Trash2 size={18} /> Remover dispositivo
+            </h2>
+            <p>
+              Retire este dispositivo e seus contatos do portal. A conexão da plataforma e os demais
+              dispositivos continuam funcionando.
+            </p>
+            <button className="danger" disabled={!!busy} onClick={() => setRemoveOpen(true)}>
+              <Trash2 size={16} /> Remover dispositivo
+            </button>
+          </section>
         </div>
+      )}
+      {removeOpen && user.role === "admin" && (
+        <Modal title="Remover este dispositivo?" close={() => setRemoveOpen(false)} busy={!!busy}>
+          <div className="device-profile">
+            <DeviceAvatar device={c} />
+            <div>
+              <strong>{c.profile_name || c.name}</strong>
+              <p>{c.number ? `+${c.number}` : c.name}</p>
+            </div>
+          </div>
+          <p>
+            Os contatos, as exceções e o histórico deste dispositivo no portal serão excluídos. As
+            conversas já recebidas no Signal serão mantidas.
+          </p>
+          <p>
+            {c.managed
+              ? "A conexão com o WhatsApp será encerrada. Para usar este número novamente, será necessário fazer um novo pareamento."
+              : "A instância existente na Evolution será mantida. Apenas o webhook deste portal será desativado."}
+          </p>
+          <p>
+            O transbordo será pausado ao confirmar. Envios já em andamento podem terminar antes da
+            remoção.
+          </p>
+          <div className="button-row">
+            <button className="secondary" disabled={!!busy} onClick={() => setRemoveOpen(false)}>
+              Cancelar
+            </button>
+            <button
+              className="danger"
+              disabled={!!busy}
+              onClick={() =>
+                void run(
+                  "remove-device",
+                  async () => {
+                    await api(`/connections/${c.id}`, {}, "DELETE");
+                    setRemoveOpen(false);
+                    back();
+                  },
+                  "Dispositivo removido. A conexão da plataforma com o Signal foi mantida.",
+                )
+              }
+            >
+              {busy === "remove-device" ? <Spinner /> : <Trash2 size={16} />}
+              {busy === "remove-device" ? "Removendo…" : "Confirmar remoção"}
+            </button>
+          </div>
+        </Modal>
       )}
     </>
   );
@@ -1368,6 +1448,7 @@ const reasonNames: Record<string, string> = {
   SIGNAL_UNREACHABLE: "Signal indisponível",
   BEFORE_ACTIVATION: "Anterior à ativação",
   IDENTITY_UNRESOLVED: "Identidade pendente · sincronize contatos",
+  DEVICE_REMOVED: "Remoção do dispositivo",
 };
 const auditNames: Record<string, string> = {
   "overflow.enabled": "Ativou o transbordo",
@@ -1376,6 +1457,8 @@ const auditNames: Record<string, string> = {
   "contact.allowed": "Liberou um contato",
   "contacts.synced": "Sincronizou contatos",
   "connection.created": "Adicionou uma conexão",
+  "connection.removed": "Removeu um dispositivo",
+  "connection.removal_failed": "Não foi possível remover o dispositivo",
   "connection.signal_configured": "Configurou o Signal",
   "connection.webhook_installed": "Conectou o recebimento",
   "connection.key_rotated": "Gerou nova chave",
