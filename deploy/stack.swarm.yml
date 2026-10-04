@@ -34,7 +34,8 @@ services:
     deploy:
       replicas: 1
       placement:
-        constraints: [node.hostname == ${PORTAL_NODE:?Defina PORTAL_NODE}]
+        constraints:
+          - node.hostname == ${PORTAL_NODE:?Defina PORTAL_NODE}
       resources:
         limits:
           cpus: "1.0"
