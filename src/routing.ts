@@ -60,6 +60,7 @@ export function receive(store: Store, c: Connection, input: unknown) {
     store.db
       .prepare("UPDATE connections SET state=?,number=COALESCE(?,number) WHERE id=?")
       .run(state, sender.endsWith("@s.whatsapp.net") ? sender.split("@")[0]! : null, c.id);
+    store.queueDeviceUpdate(c.id);
     return { accepted: true, status: "connection" };
   }
   if (["CONTACTS_SET", "CONTACTS_UPSERT", "CONTACTS_UPDATE"].includes(event)) {
@@ -124,7 +125,7 @@ export function receive(store: Store, c: Connection, input: unknown) {
               ? "CONTACT_IGNORED"
               : unresolvedWithExclusions
                 ? "IDENTITY_UNRESOLVED"
-                : !c.signal_configured
+                : !store.signalUrl(c)
                   ? "SIGNAL_NOT_CONFIGURED"
                   : undefined;
       return store.enqueue(c, dedupe, event, peer, clean, reason);
@@ -149,10 +150,12 @@ export class Dispatcher {
       if (!job) return false;
       const c = this.store.connection(job.connection_id);
       if (
-        !c.overflow ||
-        this.store.isIgnored(c.id, job.peer) ||
         !job.payload ||
-        ["OVERFLOW_DISABLED", "CONTACT_IGNORED"].includes(job.last_error ?? "")
+        job.last_error === "DESTINATION_CHANGED" ||
+        (job.event !== "DEVICE_UPDATE" &&
+          (!c.overflow ||
+            this.store.isIgnored(c.id, job.peer) ||
+            ["OVERFLOW_DISABLED", "CONTACT_IGNORED"].includes(job.last_error ?? "")))
       ) {
         this.store.finish(job.id, "ignored", !c.overflow ? "OVERFLOW_DISABLED" : "CONTACT_IGNORED");
         return true;
@@ -164,8 +167,15 @@ export class Dispatcher {
       let error = "SIGNAL_UNREACHABLE";
       let retryable = true;
       try {
-        const url = validSignalUrl(this.store.secrets(c).signalUrl ?? "", this.config);
-        const payload = this.store.vault.open(job.payload, job.id);
+        const url = validSignalUrl(this.store.signalUrl(c) ?? "", this.config);
+        let payload = this.store.vault.open<Record<string, unknown>>(job.payload, job.id);
+        if (this.store.platform().signalUrl) {
+          payload = {
+            ...payload,
+            ...this.store.deviceEnvelope(c),
+            instance: this.store.platform().id,
+          };
+        }
         const response = await this.fetcher(url, {
           method: "POST",
           headers: { "content-type": "application/json" },

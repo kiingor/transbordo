@@ -52,6 +52,9 @@ type Connection = {
   overflow: number;
   state: string;
   number: string | null;
+  profile_name: string | null;
+  profile_synced_at: number | null;
+  has_photo: number;
   signal_configured: number;
   webhook_configured: number;
   last_sync: number | null;
@@ -88,7 +91,11 @@ const errors: Record<string, string> = {
   SIGNAL_NOT_CONFIGURED: "Configure SIGNAL_API_ORIGIN no servidor do portal.",
   INVALID_SIGNAL_WEBHOOK:
     "Use o webhook Evolution completo gerado pelo Signal, na origem configurada.",
-  CONNECTION_SETUP_REQUIRED: "Conecte o WhatsApp e salve o webhook do Signal antes de ativar.",
+  CONNECTION_SETUP_REQUIRED:
+    "Conecte o dispositivo e configure a integração da plataforma antes de ativar.",
+  PLATFORM_INTEGRATION_REQUIRED: "Configure o Signal na conexão única da plataforma.",
+  EVOLUTION_INVALID_PROFILE: "A Evolution ainda não disponibilizou o perfil do dispositivo.",
+  EVOLUTION_PROFILE_NOT_FOUND: "Conecte o WhatsApp antes de sincronizar o perfil.",
   PAUSE_BEFORE_CHANGING_WEBHOOK: "Pause o transbordo antes de alterar o destino.",
   ALREADY_EXISTS: "Essa instância ou esse e-mail já está cadastrado.",
   EVOLUTION_HTTP_401: "A Evolution recusou a chave. Confira as credenciais da instância.",
@@ -362,8 +369,12 @@ function App() {
   const [search, setSearch] = useState(""),
     [passwordOpen, setPasswordOpen] = useState(false);
   const refresh = useCallback(async () => {
-    const result = await api<{ connections: Connection[] }>("/connections");
+    const [result, platform] = await Promise.all([
+      api<{ connections: Connection[] }>("/connections"),
+      api<Integration>("/platform"),
+    ]);
     setConnections(result.connections);
+    setIntegration(platform);
   }, []);
   useEffect(() => {
     const expired = () => {
@@ -413,7 +424,7 @@ function App() {
   if (!user) return <Login done={setUser} />;
   const current = connections.find((c) => c.id === selected);
   const active = connections.filter((c) => c.overflow).length;
-  const title = tab === "activity" ? "Atividade" : tab === "team" ? "Equipe" : "Conexões";
+  const title = tab === "activity" ? "Atividade" : tab === "team" ? "Equipe" : "Dispositivos";
   return (
     <FeedbackContext.Provider value={notice?.error ? notice.text : ""}>
       <div className="shell">
@@ -432,7 +443,7 @@ function App() {
               className={tab === "connections" ? "active" : ""}
               onClick={() => setTab("connections")}
             >
-              <Smartphone size={19} /> Conexões <span>{connections.length}</span>
+              <Smartphone size={19} /> Dispositivos <span>{connections.length}</span>
             </button>
             <button
               className={tab === "activity" ? "active" : ""}
@@ -491,10 +502,12 @@ function App() {
             <header className="page-heading">
               <div>
                 <span className="eyebrow">WHATSAPP + SIGNAL</span>
-                <h1>{current && tab === "connections" ? current.name : title}</h1>
+                <h1>
+                  {current && tab === "connections" ? current.profile_name || current.name : title}
+                </h1>
                 <p>
                   {tab === "connections"
-                    ? "Controle o que chega ao Signal, um número de cada vez."
+                    ? "Uma conexão com o Signal, todos os seus dispositivos."
                     : tab === "activity"
                       ? "Acompanhe encaminhamentos e alterações da sua equipe."
                       : "Pessoas com acesso aos números e ao transbordo."}
@@ -502,7 +515,7 @@ function App() {
               </div>
               {tab === "connections" && user.role === "admin" && (
                 <button className="primary" onClick={() => setCreate(true)}>
-                  <Plus size={17} /> Adicionar número
+                  <Plus size={17} /> Adicionar dispositivo
                 </button>
               )}
             </header>
@@ -537,13 +550,20 @@ function App() {
             )}
             {tab === "connections" && !current && (
               <>
+                <PlatformIntegration
+                  integration={integration}
+                  user={user}
+                  busy={busy}
+                  run={run}
+                  active={active}
+                />
                 <div className="stats">
                   <div>
                     <span className="stat-icon">
                       <Smartphone size={21} />
                     </span>
                     <span>
-                      <small>Números conectados</small>
+                      <small>Dispositivos conectados</small>
                       <strong>
                         {connections.filter((c) => c.state === "open").length}
                         <em> / {connections.length}</em>
@@ -578,7 +598,7 @@ function App() {
                 <div className="section-heading">
                   <div>
                     <h2>
-                      Seus números <span className="count">{connections.length}</span>
+                      Seus dispositivos <span className="count">{connections.length}</span>
                     </h2>
                     <p>Ative, pause e escolha quais contatos encaminhar.</p>
                   </div>
@@ -586,7 +606,7 @@ function App() {
                     <Search size={17} />
                     <input
                       placeholder="Buscar número ou nome"
-                      aria-label="Buscar conexão"
+                      aria-label="Buscar dispositivo"
                       value={search}
                       onChange={(e) => setSearch(e.target.value)}
                     />
@@ -595,12 +615,12 @@ function App() {
                 {connections.length === 0 ? (
                   <Empty
                     icon={<Smartphone size={30} />}
-                    title="Seu primeiro número começa aqui"
-                    text="Conecte um WhatsApp, vincule ao Signal e ative o transbordo quando estiver pronto."
+                    title="Seu primeiro dispositivo começa aqui"
+                    text="Conecte um WhatsApp à plataforma e ative o transbordo quando estiver pronto."
                   >
                     {user.role === "admin" && (
                       <button className="primary" onClick={() => setCreate(true)}>
-                        <Plus size={17} /> Adicionar número
+                        <Plus size={17} /> Adicionar dispositivo
                       </button>
                     )}
                   </Empty>
@@ -608,18 +628,16 @@ function App() {
                   <div className="connection-grid">
                     {connections
                       .filter((c) =>
-                        `${c.name} ${c.number ?? ""} ${c.instance}`
+                        `${c.profile_name ?? ""} ${c.name} ${c.number ?? ""} ${c.instance}`
                           .toLowerCase()
                           .includes(search.toLowerCase()),
                       )
                       .map((c) => (
                         <article className="connection-card" key={c.id}>
                           <div className="card-title">
-                            <span className="number-icon">
-                              <Smartphone size={23} />
-                            </span>
+                            <DeviceAvatar device={c} />
                             <div>
-                              <h3>{c.name}</h3>
+                              <h3>{c.profile_name || c.name}</h3>
                               <span>
                                 {c.number
                                   ? `+${c.number}`
@@ -676,10 +694,9 @@ function App() {
                             className="card-link"
                             onClick={() => {
                               setSelected(c.id);
-                              setIntegration(null);
                             }}
                           >
-                            <span>Gerenciar conexão</span>
+                            <span>Gerenciar dispositivo</span>
                             <ArrowRight size={16} />
                           </button>
                         </article>
@@ -706,13 +723,10 @@ function App() {
               <ConnectionDetail
                 connection={current}
                 user={user}
-                integration={integration}
-                setIntegration={setIntegration}
                 busy={busy}
                 run={run}
                 back={() => {
                   setSelected(null);
-                  setIntegration(null);
                 }}
               />
             )}
@@ -724,13 +738,12 @@ function App() {
           </footer>
         </main>
         {create && (
-          <Modal title="Adicionar número" close={() => setCreate(false)}>
+          <Modal title="Adicionar dispositivo" close={() => setCreate(false)}>
             <NewConnection
               busy={!!busy}
               submit={(body) =>
                 void run("create", async () => {
-                  const result = await api<Integration & { id: string }>("/connections", body);
-                  setIntegration(result);
+                  const result = await api<{ id: string }>("/connections", body);
                   setSelected(result.id);
                   setCreate(false);
                   setTab("connections");
@@ -796,7 +809,7 @@ function NewConnection({ submit, busy }: { submit: (body: unknown) => void; busy
     >
       <p className="muted">Cada número tem seu próprio transbordo e lista de contatos ignorados.</p>
       <label>
-        Nome da conexão
+        Nome do dispositivo
         <input
           name="name"
           placeholder="Ex.: Atendimento comercial"
@@ -849,43 +862,129 @@ function NewConnection({ submit, busy }: { submit: (body: unknown) => void; busy
         </div>
       )}
       <button className="primary full" disabled={busy}>
-        {busy ? <Spinner /> : <ArrowRight size={16} />} Criar conexão
+        {busy ? <Spinner /> : <ArrowRight size={16} />} Criar dispositivo
       </button>
     </form>
   );
 }
 type Run = (key: string, fn: () => Promise<void>, message?: string) => Promise<void>;
+function DeviceAvatar({ device }: { device: Connection }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [device.id, device.profile_synced_at]);
+  return (
+    <span className="number-icon device-avatar">
+      {device.has_photo && !failed ? (
+        <img
+          src={`/api/connections/${device.id}/photo?v=${device.profile_synced_at ?? 0}`}
+          alt={`Foto de ${device.profile_name || device.name}`}
+          onError={() => setFailed(true)}
+        />
+      ) : (
+        <Smartphone size={23} />
+      )}
+    </span>
+  );
+}
+function PlatformIntegration({
+  integration,
+  user,
+  busy,
+  run,
+  active,
+}: {
+  integration: Integration | null;
+  user: User;
+  busy: string;
+  run: Run;
+  active: number;
+}) {
+  const [signal, setSignal] = useState("");
+  return (
+    <section className="panel platform-panel">
+      <div className="section-heading">
+        <div>
+          <h2>
+            <Link2 size={20} /> Conexão da plataforma
+          </h2>
+          <p>Um único canal no Signal recebe todos os dispositivos desta equipe.</p>
+        </div>
+        <span className={`connection-state ${integration?.signalConfigured ? "green" : ""}`}>
+          {integration?.signalConfigured ? "Signal configurado" : "Aguardando configuração"}
+        </span>
+      </div>
+      {user.role === "admin" && integration && (
+        <details>
+          <summary>Configurar conexão com o Signal</summary>
+          <p>
+            No Signal, crie um único canal Evolution com <strong>Conexão externa</strong>. Use os
+            dados da plataforma abaixo e salve aqui o webhook gerado. Novos dispositivos passam a
+            usar a mesma integração.
+          </p>
+          <div className="platform-fields">
+            <CopyField label="URL da plataforma" value={integration.baseUrl} />
+            <CopyField label="Identificador da plataforma" value={integration.instance} />
+            {integration.apiKey && (
+              <CopyField label="Chave da plataforma" value={integration.apiKey} secret />
+            )}
+          </div>
+          <form
+            className="webhook-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void run(
+                "platform",
+                async () => {
+                  await api("/platform", { signalUrl: signal }, "PATCH");
+                  setSignal("");
+                },
+                "Conexão da plataforma com o Signal configurada.",
+              );
+            }}
+          >
+            <label>
+              Webhook único do Signal
+              <input
+                type="password"
+                autoComplete="new-password"
+                required
+                value={signal}
+                onChange={(e) => setSignal(e.target.value)}
+                placeholder={
+                  integration.signalConfigured
+                    ? "Configurado · cole aqui para substituir"
+                    : "Cole a URL completa do webhook"
+                }
+              />
+            </label>
+            <button className="primary" disabled={!!busy || active > 0}>
+              {busy === "platform" ? <Spinner /> : <Link2 size={15} />} Salvar conexão da plataforma
+            </button>
+            {active > 0 && <small>Pause todos os dispositivos antes de alterar a conexão.</small>}
+          </form>
+        </details>
+      )}
+    </section>
+  );
+}
 function ConnectionDetail({
   connection: c,
   user,
-  integration,
-  setIntegration,
   busy,
   run,
   back,
 }: {
   connection: Connection;
   user: User;
-  integration: Integration | null;
-  setIntegration: (i: Integration) => void;
   busy: string;
   run: Run;
   back: () => void;
 }) {
   const [tab, setTab] = useState("contacts"),
-    [qr, setQr] = useState<string | null>(null),
-    [signal, setSignal] = useState("");
+    [qr, setQr] = useState<string | null>(null);
   useEffect(() => {
     setQr(null);
-    setSignal("");
     setTab(c.webhook_configured || user.role !== "admin" ? "contacts" : "setup");
   }, [c.id]);
-  useEffect(() => {
-    if (user.role === "admin" && !integration)
-      api<Integration>(`/connections/${c.id}/integration`)
-        .then(setIntegration)
-        .catch(() => {});
-  }, [c.id, user.role, integration, setIntegration]);
   useEffect(() => {
     if (!qr) return;
     const timer = setInterval(() => {
@@ -898,14 +997,14 @@ function ConnectionDetail({
   return (
     <>
       <button className="back" onClick={back}>
-        <ChevronLeft size={15} /> Todos os números
+        <ChevronLeft size={15} /> Todos os dispositivos
       </button>
       <div className="detail-banner">
-        <span className="number-icon">
-          <Smartphone size={25} />
-        </span>
+        <DeviceAvatar device={c} />
         <div>
-          <strong>{c.number ? `+${c.number}` : c.name}</strong>
+          <strong>{c.profile_name || c.name}</strong>
+          {" · "}
+          <span>{c.number ? `+${c.number}` : "Aguardando pareamento"}</span>
           <small>{stateLabel(c.state)}</small>
         </div>
         <div className="detail-toggle">
@@ -930,7 +1029,7 @@ function ConnectionDetail({
         </button>
         {user.role === "admin" && (
           <button className={tab === "setup" ? "active" : ""} onClick={() => setTab("setup")}>
-            <Link2 size={16} /> Conectar ao Signal
+            <Smartphone size={16} /> Dispositivo e perfil
           </button>
         )}
       </div>
@@ -993,80 +1092,35 @@ function ConnectionDetail({
             )}
           </section>
           <section className="panel">
-            <h2>
-              <span className="step">2</span> Vincule ao Signal
-            </h2>
-            <p>
-              No Signal, crie um canal Evolution e marque <strong>Conexão externa</strong>. Preencha
-              os campos abaixo.
-            </p>
-            {integration && (
-              <>
-                <CopyField label="URL da conexão" value={integration.baseUrl} />
-                <CopyField label="Instância" value={integration.instance} />
-                {integration.apiKey ? (
-                  <>
-                    <CopyField label="Chave da conexão" value={integration.apiKey} secret />
-                    <small className="muted">
-                      Copie agora. Essa chave não será exibida novamente.
-                    </small>
-                  </>
-                ) : (
-                  <button
-                    className="secondary"
-                    disabled={!!busy}
-                    onClick={() => {
-                      if (
-                        window.confirm(
-                          "Gerar uma nova chave invalida a anterior. Atualize a chave no Signal após continuar.",
-                        )
-                      )
-                        void run("rotate", async () =>
-                          setIntegration(
-                            await api<Integration>(`/connections/${c.id}/rotate-key`, {}),
-                          ),
-                        );
-                    }}
-                  >
-                    <KeyRound size={14} /> Gerar nova chave
-                  </button>
-                )}
-              </>
-            )}
-            <form
-              className="webhook-form"
-              onSubmit={(e) => {
-                e.preventDefault();
+            <h2>Perfil do dispositivo</h2>
+            <p>Nome de usuário, foto e número são sincronizados do WhatsApp pela Evolution.</p>
+            <div className="device-profile">
+              <DeviceAvatar device={c} />
+              <div>
+                <strong>{c.profile_name || c.name}</strong>
+                <p>{c.number ? `+${c.number}` : "Número ainda não conectado"}</p>
+              </div>
+            </div>
+            <p className="muted">Última sincronização: {date(c.profile_synced_at)}</p>
+            <button
+              className="secondary"
+              disabled={!!busy}
+              onClick={() =>
                 void run(
-                  "webhook",
+                  "profile",
                   async () => {
-                    await api(`/connections/${c.id}`, { signalUrl: signal }, "PATCH");
-                    setSignal("");
+                    await api(`/connections/${c.id}/profile`, {});
                   },
-                  "Webhook do Signal salvo. Você já pode ativar o transbordo.",
-                );
-              }}
+                  "Nome e foto do dispositivo sincronizados.",
+                )
+              }
             >
-              <label>
-                Webhook gerado pelo Signal
-                <input
-                  type="password"
-                  autoComplete="new-password"
-                  placeholder={
-                    c.signal_configured
-                      ? "Configurado · cole aqui para substituir"
-                      : "Cole a URL completa do webhook"
-                  }
-                  required
-                  value={signal}
-                  onChange={(e) => setSignal(e.target.value)}
-                />
-              </label>
-              <button className="primary" disabled={!!busy || !!c.overflow}>
-                {busy === "webhook" ? <Spinner /> : <Link2 size={15} />} Salvar webhook
-              </button>
-              {c.overflow > 0 && <small>Pause o transbordo para alterar o webhook.</small>}
-            </form>
+              <RefreshCw size={16} /> Sincronizar perfil
+            </button>
+            <div className="flow-note">
+              <Link2 size={16} />
+              <p>Este dispositivo usa a conexão única da plataforma com o Signal.</p>
+            </div>
           </section>
         </div>
       )}
@@ -1374,7 +1428,7 @@ function ActivityPage() {
             <table>
               <thead>
                 <tr>
-                  <th>Conexão</th>
+                  <th>Dispositivo</th>
                   <th>Evento</th>
                   <th>Resultado</th>
                   <th>Detalhes</th>

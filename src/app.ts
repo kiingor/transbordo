@@ -212,6 +212,35 @@ export async function buildApp(
       return { ok: true };
     });
     api.get("/api/connections", async () => ({ connections: store.listConnections() }));
+    api.get("/api/platform", async (request) => {
+      const user = session(request),
+        platform = store.platform();
+      return {
+        id: platform.id,
+        instance: platform.id,
+        baseUrl: `${config.PUBLIC_URL.replace(/\/+$/, "")}/platform`,
+        signalConfigured: !!platform.signalUrl,
+        ...(user.role === "admin" ? { apiKey: platform.apiKey } : {}),
+      };
+    });
+    api.patch("/api/platform", { bodyLimit: 8192 }, async (request) => {
+      const user = admin(request);
+      const body = z
+        .object({ signalUrl: z.string().max(8192) })
+        .strict()
+        .parse(request.body);
+      store.setPlatformWebhook(validSignalUrl(body.signalUrl, config), user.id);
+      return { ok: true };
+    });
+    api.get<{ Params: { id: string } }>("/api/connections/:id/photo", async (request, reply) => {
+      const c = store.connection(request.params.id);
+      if (!c.profile_photo || !c.profile_photo_type)
+        return reply.code(404).send({ error: "PHOTO_NOT_FOUND" });
+      return reply.type(c.profile_photo_type).send(Buffer.from(c.profile_photo));
+    });
+    api.post<{ Params: { id: string } }>("/api/connections/:id/profile", async (request) =>
+      evolution.syncProfile(store.connection(request.params.id)),
+    );
     api.post("/api/connections", { bodyLimit: 8192 }, async (request, reply) => {
       const user = admin(request),
         body = newConnection.parse(request.body);
@@ -219,6 +248,7 @@ export async function buildApp(
         throw new AppError(503, "EVOLUTION_NOT_CONFIGURED");
       const created = store.createConnection(body);
       store.audit(user.id, "connection.created", created.connection.id);
+      store.queueDeviceUpdate(created.connection.id);
       reply.code(201);
       return {
         id: created.connection.id,
@@ -244,7 +274,10 @@ export async function buildApp(
         store.transaction(() => {
           if (body.name !== undefined)
             store.db.prepare("UPDATE connections SET name=? WHERE id=?").run(body.name, c.id);
+          if (body.name !== undefined) store.queueDeviceUpdate(c.id);
           if (body.signalUrl !== undefined) {
+            if (store.platform().signalUrl)
+              throw new AppError(409, "PLATFORM_INTEGRATION_REQUIRED");
             if (c.overflow) throw new AppError(409, "PAUSE_BEFORE_CHANGING_WEBHOOK");
             store.setSecrets(c, {
               ...store.secrets(c),
@@ -354,6 +387,71 @@ export async function buildApp(
     });
   });
 
+  async function platformAuth(request: FastifyRequest) {
+    const key = request.headers.apikey;
+    if (typeof key !== "string" || !equalSecret(key, store.platform().apiKey))
+      throw new AppError(401, "INVALID_API_KEY");
+  }
+  app.get("/platform/devices", { onRequest: platformAuth }, async () => ({
+    platformId: store.platform().id,
+    devices: store.db
+      .prepare("SELECT id FROM connections ORDER BY created_at")
+      .all()
+      .map((row) => store.deviceProfile(store.connection(String(row.id)))),
+  }));
+  app.post("/platform/webhook", { onRequest: platformAuth, bodyLimit: 8192 }, async (request) => {
+    const body = z
+      .object({ signalUrl: z.string().max(8192) })
+      .strict()
+      .parse(request.body);
+    store.setPlatformWebhook(validSignalUrl(body.signalUrl, config), "signal");
+    return { ok: true };
+  });
+  app.get<{ Params: { id: string } }>(
+    "/platform/devices/:id/photo",
+    { onRequest: platformAuth },
+    async (request, reply) => {
+      const c = store.connection(request.params.id);
+      if (!c.profile_photo || !c.profile_photo_type)
+        return reply.code(404).send({ error: "PHOTO_NOT_FOUND" });
+      return reply.type(c.profile_photo_type).send(Buffer.from(c.profile_photo));
+    },
+  );
+  app.route<{ Params: { category: string; action: string; instance: string } }>({
+    method: ["GET", "POST", "PUT", "DELETE"],
+    url: "/platform/:category/:action/:instance",
+    onRequest: platformAuth,
+    config: { rateLimit: { max: 1000, timeWindow: "1 minute" } },
+    handler: async (request, reply) => {
+      const { category, action, instance } = request.params;
+      if (instance === store.platform().id) {
+        if (request.method === "GET" && category === "instance" && action === "connectionState")
+          return { instance: { state: "open" }, scope: "platform" };
+        if (request.method === "POST" && category === "instance" && action === "setPresence")
+          return { status: "managed_by_portal" };
+        throw new AppError(409, "DEVICE_REQUIRED");
+      }
+      const c = store.connection(instance);
+      const result = await bridge(
+        evolution,
+        c,
+        request.method,
+        category,
+        action,
+        c.instance,
+        request.body,
+      );
+      if (category === "message")
+        store.audit(
+          "signal",
+          result.status < 300 ? "response.sent" : "response.failed",
+          c.id,
+          String(result.status),
+        );
+      return reply.code(result.status).send(result.body);
+    },
+  });
+
   function integration(id: string, key?: string) {
     const c = store.connection(id);
     return {
@@ -431,8 +529,8 @@ export async function buildApp(
     reply.type("text/css").send(await readFile(resolve(publicDir, "app.css"))),
   );
   app.addHook("onClose", async () => {
-    await dispatcher.stop();
+    await Promise.all([dispatcher.stop(), evolution.stop()]);
     if (!options.store) store.close();
   });
-  return { app, store, dispatcher };
+  return { app, store, dispatcher, evolution };
 }

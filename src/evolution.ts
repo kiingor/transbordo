@@ -118,7 +118,97 @@ export class Evolution {
     );
     const state = string(object(payload.instance).state) || string(payload.state) || "close";
     this.store.db.prepare("UPDATE connections SET state=? WHERE id=?").run(state, c.id);
+    await this.syncProfile(this.store.connection(c.id)).catch(() => undefined);
     return { state };
+  }
+  async syncProfile(c: Connection) {
+    const payload = await this.json(
+      c,
+      `instance/fetchInstances?instanceName=${encodeURIComponent(c.instance)}`,
+    );
+    const rows = Array.isArray(payload) ? payload : object(payload).instances;
+    if (!Array.isArray(rows)) throw new AppError(502, "EVOLUTION_INVALID_PROFILE");
+    const entry = rows
+      .map(object)
+      .find(
+        (row) =>
+          (string(row.name) ||
+            string(row.instanceName) ||
+            string(object(row.instance).instanceName)) === c.instance,
+      );
+    if (!entry) throw new AppError(404, "EVOLUTION_PROFILE_NOT_FOUND");
+    const profile = { ...object(entry.instance), ...entry };
+    const profileName =
+      (string(profile.profileName) || string(profile.profile_name)).slice(0, 200) || null;
+    const jid = normalizeJid(string(profile.ownerJid) || string(profile.owner));
+    const number = /^\d+@s\.whatsapp\.net$/.test(jid) ? jid.split("@")[0]! : c.number;
+    const rawPicture = string(profile.profilePicUrl) || string(profile.profilePictureUrl);
+    let picture: string | null = null;
+    try {
+      const url = new URL(rawPicture);
+      if (url.protocol === "https:" && !url.username && !url.password && rawPicture.length < 8192)
+        picture = url.toString();
+    } catch {
+      /* Evolution uses null when no profile picture is available. */
+    }
+    let photo = c.profile_photo,
+      photoType = c.profile_photo_type;
+    if (!picture) {
+      photo = null;
+      photoType = null;
+    } else if (!this.stopping) {
+      try {
+        const response = await this.fetcher(picture, { method: "GET", redirect: "error" });
+        const type = response.headers.get("content-type")?.split(";")[0]?.toLowerCase();
+        if (response.ok && type && ["image/jpeg", "image/png", "image/webp"].includes(type)) {
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          if (bytes.length > 0 && bytes.length <= 2 * 1024 * 1024) {
+            photo = bytes;
+            photoType = type;
+          }
+        }
+      } catch {
+        /* Keep the previous cached photo on transient CDN failures. */
+      }
+    }
+    const state = string(profile.connectionStatus) || c.state;
+    this.store.transaction(() => {
+      this.store.db
+        .prepare(`UPDATE connections SET profile_name=?,number=?,profile_picture_url=?,
+        profile_photo=?,profile_photo_type=?,profile_synced_at=?,state=? WHERE id=?`)
+        .run(profileName, number, picture, photo, photoType, Date.now(), state, c.id);
+      if (
+        profileName !== c.profile_name ||
+        number !== c.number ||
+        picture !== c.profile_picture_url ||
+        state !== c.state ||
+        !Buffer.from(photo ?? []).equals(Buffer.from(c.profile_photo ?? []))
+      )
+        this.store.queueDeviceUpdate(c.id);
+    });
+    return this.store.deviceProfile(this.store.connection(c.id));
+  }
+  private refreshingProfiles = false;
+  private stopping = false;
+  async stop() {
+    this.stopping = true;
+    while (this.refreshingProfiles) await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  async refreshProfiles() {
+    if (this.refreshingProfiles || this.stopping) return;
+    this.refreshingProfiles = true;
+    try {
+      const devices = this.store.db
+        .prepare(`SELECT id FROM connections WHERE webhook_configured=1
+        AND (profile_synced_at IS NULL OR profile_synced_at<?) ORDER BY profile_synced_at LIMIT 20`)
+        .all(Date.now() - 5 * 60_000);
+      for (const device of devices) {
+        if (this.stopping) break;
+        await this.syncProfile(this.store.connection(String(device.id))).catch(() => undefined);
+      }
+    } finally {
+      this.refreshingProfiles = false;
+    }
   }
   async pair(c: Connection) {
     const { state } = await this.status(c);

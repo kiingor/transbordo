@@ -7,10 +7,12 @@ O repositório e o banco são próprios. Não há acesso direto ao banco do Sign
 
 - Login por pessoa, perfis administrador e operador e revogação de sessões.
 - Novas instâncias Evolution por QR Code ou vinculação de uma instância existente com sua chave.
-- Transbordo individual por número, inicialmente pausado.
+- Uma conexão da plataforma com um único canal no Signal; vários dispositivos sob essa conexão.
+- Transbordo individual por dispositivo, inicialmente pausado.
+- Nome de usuário, foto e número sincronizados da Evolution; fotos servidas somente a usuários autenticados.
 - Sincronização de contatos, busca, paginação e exclusões individuais, preservadas nas sincronizações.
 - Recebimento autenticado, fila persistente, deduplicação e tentativas de entrega ao Signal.
-- Retorno das respostas por uma API compatível com Evolution, com chave exclusiva por conexão.
+- Retorno das respostas por uma API compatível com Evolution, com uma chave da plataforma e roteamento pelo dispositivo de origem.
 - Histórico de entregas e alterações, sem exibir conteúdo de mensagens ou chaves.
 
 ## Executar localmente
@@ -50,21 +52,40 @@ Uma Evolution remota não alcança o `localhost` do Mac: o QR/webhook real exige
 
 ## Vincular ao Signal
 
-1. Adicione um número no portal. Copie a URL da conexão, instância e chave mostrada uma única vez.
-2. Clique em **Conectar WhatsApp**. Para instâncias existentes, essa ação substitui o webhook atual pelo portal. Para novas, provisiona a instância e apresenta o QR Code.
-3. No Signal, crie um canal **Evolution API**, marque **Conexão externa** e use os três campos do portal.
-4. Copie o webhook completo gerado pelo Signal e salve no portal.
-5. Sincronize os contatos, configure as exceções e ative o transbordo.
+1. No painel **Dispositivos**, abra **Conexão da plataforma** e copie URL, identificador e chave (administrador).
+2. No Signal, crie **um único canal Evolution API**, marque **Conexão externa**, escolha a unidade e use esses três campos.
+3. Copie o webhook completo gerado pelo Signal e salve em **Webhook único do Signal** no portal.
+4. Adicione dispositivos e clique em **Conectar WhatsApp**. Para uma instância existente, essa ação substitui seu webhook atual pelo portal; para uma nova, provisiona e apresenta o QR Code.
+5. Confira nome, foto e número em **Dispositivo e perfil**, sincronize contatos, configure exceções e ative o transbordo de cada aparelho.
 
 ```text
-Evolution ── webhook autenticado ──> Portal ── fila durável ──> Signal
-Evolution <── envio da resposta ─── Portal <── API Evolution ─ Signal
+Vários dispositivos Evolution → Portal → Um canal no Signal
+Dispositivo de origem         ← Portal ← Resposta do Signal
 ```
 
-O Signal continua usando `provider=evolution`; a flag pública é `externalConnection=true`
-e o provisionamento é `existing`. Sua URL Evolution aponta para `/bridge/:connectionId`.
-O Signal não reinicia nem exclui remotamente uma conexão externa. QR e pareamento pertencem ao portal.
-O portal permite apenas operações necessárias ao transporte e bloqueia administração remota pelo bridge.
+O Signal usa `provider=evolution`, `externalConnection=true`, `externalPlatform=true` e
+provisionamento `existing`. A URL é `/platform`; a instância configurada no Signal é o UUID
+da plataforma. O webhook leva esse UUID e `device.id`. O Signal conserva o dispositivo nas
+referências de conversa, mensagem e mídia e o envia na URL ao responder. A chave global nunca
+é uma chave administrativa da Evolution: o portal traduz cada operação para a instância correta.
+
+Todos os dispositivos usam o mesmo canal, inclusive os adicionados depois. O catálogo autenticado
+`/platform/devices` permite ao Signal exibir os nomes, números e fotos. Perfis são atualizados a
+cada cinco minutos e também no pareamento ou pelo botão **Sincronizar perfil**. A chave só aparece
+para administradores; operadores podem controlar transbordo e contatos.
+
+O Signal não reinicia nem exclui dispositivos externos. QR e pareamento pertencem ao portal.
+O portal permite apenas operações necessárias ao transporte. Envios sem dispositivo são recusados;
+o envio de teste do Signal oferece uma seleção explícita do aparelho.
+
+### Atualização de uma instalação anterior
+
+Faça backup consistente do SQLite e preserve a chave de cifragem. A migração para schema 2 é
+transacional e preserva usuários, dispositivos, contatos, exclusões e fila. Gera uma identidade e
+chave globais estáveis. Bridges individuais antigos continuam compatíveis até a configuração do
+webhook global. Para migrar, pause os dispositivos, configure o único canal da plataforma e então
+reative os aparelhos desejados. Alterar o webhook exige todos pausados e descarta pendências do
+destino anterior, sem replay. Canais antigos do Signal não são removidos automaticamente.
 
 ## Regras de encaminhamento
 

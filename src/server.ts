@@ -1,15 +1,19 @@
 import { readConfig } from "./config.js";
 import { buildApp } from "./app.js";
 const config = readConfig();
-const { app, store, dispatcher } = await buildApp(config);
+const { app, store, dispatcher, evolution } = await buildApp(config);
 // One process owns SQLite and the dispatcher; run one replica per volume.
 const timer = setInterval(() => {
   void dispatcher.tick().catch(() => app.log.error("Dispatcher failed; delivery remains durable"));
 }, 200);
 const cleanup = setInterval(() => store.prune(), 3600_000);
+const profiles = setInterval(() => {
+  void evolution.refreshProfiles().catch(() => app.log.warn("Device profile sync unavailable"));
+}, 60_000);
 app.addHook("onClose", async () => {
   clearInterval(timer);
   clearInterval(cleanup);
+  clearInterval(profiles);
 });
 await app.listen({ host: config.HOST, port: config.PORT });
 let closing = false;

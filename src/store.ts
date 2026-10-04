@@ -12,6 +12,11 @@ export interface Connection {
   overflow: number;
   state: string;
   number: string | null;
+  profile_name: string | null;
+  profile_picture_url: string | null;
+  profile_photo: Uint8Array | null;
+  profile_photo_type: string | null;
+  profile_synced_at: number | null;
   secrets: string;
   bridge_hash: string;
   webhook_hash: string;
@@ -25,6 +30,12 @@ export interface Secrets {
   evolutionKey: string;
   webhookToken: string;
   signalUrl?: string;
+}
+export interface Platform {
+  id: string;
+  apiKey: string;
+  signalUrl?: string;
+  revision: number;
 }
 export interface User {
   id: string;
@@ -64,6 +75,10 @@ export class Store {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     this.vault = new Vault(Buffer.from(key, "base64"));
+    if (Number(this.db.prepare("PRAGMA user_version").get()?.user_version) > 2) {
+      this.db.close();
+      throw new Error("DATABASE_VERSION_UNSUPPORTED");
+    }
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -94,7 +109,105 @@ export class Store {
       CREATE TABLE IF NOT EXISTS audit (
         id INTEGER PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, connection_id TEXT,
         detail TEXT NOT NULL, created_at INTEGER NOT NULL);
-      PRAGMA user_version=1;`);
+      CREATE TABLE IF NOT EXISTS platform (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1), id TEXT NOT NULL UNIQUE,
+        secrets TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0);`);
+    this.transaction(() => {
+      const columns = new Set(
+        this.db
+          .prepare("PRAGMA table_info(connections)")
+          .all()
+          .map((c) => c.name),
+      );
+      for (const [name, type] of Object.entries({
+        profile_name: "TEXT",
+        profile_picture_url: "TEXT",
+        profile_photo: "BLOB",
+        profile_photo_type: "TEXT",
+        profile_synced_at: "INTEGER",
+      })) {
+        if (!columns.has(name)) this.db.exec(`ALTER TABLE connections ADD COLUMN ${name} ${type}`);
+      }
+      if (!this.db.prepare("SELECT 1 FROM platform WHERE singleton=1").get()) {
+        const id = randomUUID();
+        this.db
+          .prepare("INSERT INTO platform(singleton,id,secrets) VALUES(1,?,?)")
+          .run(id, this.vault.seal({ apiKey: token() }, `platform:${id}`));
+      }
+      this.db.exec("PRAGMA user_version=2");
+    });
+  }
+  platform(): Platform {
+    const row = this.db
+      .prepare("SELECT id,secrets,revision FROM platform WHERE singleton=1")
+      .get() as { id: string; secrets: string; revision: number };
+    return {
+      id: row.id,
+      revision: row.revision,
+      ...this.vault.open<{ apiKey: string; signalUrl?: string }>(row.secrets, `platform:${row.id}`),
+    };
+  }
+  setPlatformWebhook(signalUrl: string, actor: string) {
+    this.transaction(() => {
+      const platform = this.platform();
+      if (platform.signalUrl === signalUrl) return;
+      if (this.db.prepare("SELECT 1 FROM connections WHERE overflow=1 LIMIT 1").get())
+        throw new AppError(409, "PAUSE_BEFORE_CHANGING_WEBHOOK");
+      this.db
+        .prepare("UPDATE platform SET secrets=?,revision=revision+1 WHERE singleton=1")
+        .run(this.vault.seal({ apiKey: platform.apiKey, signalUrl }, `platform:${platform.id}`));
+      // Pending work belongs to its old destination. Linking the platform never replays it.
+      this.db
+        .prepare(
+          "UPDATE deliveries SET status='ignored',payload=NULL,last_error='DESTINATION_CHANGED' WHERE status='pending'",
+        )
+        .run();
+      this.db
+        .prepare("UPDATE deliveries SET last_error='DESTINATION_CHANGED' WHERE status='processing'")
+        .run();
+      for (const row of this.db.prepare("SELECT id FROM connections").all()) {
+        const c = this.connection(String(row.id));
+        const { signalUrl: _legacy, ...secrets } = this.secrets(c);
+        this.setSecrets(c, secrets);
+        this.queueDeviceUpdate(c.id);
+      }
+      this.audit(actor, "platform.signal_configured");
+    });
+  }
+  signalUrl(c: Connection): string | undefined {
+    return this.platform().signalUrl ?? this.secrets(c).signalUrl;
+  }
+  deviceProfile(c: Connection) {
+    return {
+      id: c.id,
+      instance: c.instance,
+      name: c.name,
+      number: c.number,
+      profileName: c.profile_name,
+      hasPhoto: !!c.profile_photo,
+      state: c.state,
+      profileUpdatedAt: c.profile_synced_at,
+    };
+  }
+  deviceEnvelope(c: Connection) {
+    return { platformId: this.platform().id, device: this.deviceProfile(c) };
+  }
+  queueDeviceUpdate(id: string) {
+    const p = this.platform();
+    if (!p.signalUrl) return;
+    const c = this.connection(id),
+      profile = this.deviceEnvelope(c);
+    this.enqueue(
+      c,
+      digest(`device:${p.revision}:${JSON.stringify(profile)}`),
+      "DEVICE_UPDATE",
+      "",
+      {
+        event: "DEVICE_UPDATE",
+        instance: c.instance,
+        ...profile,
+      },
+    );
   }
   transaction<T>(fn: () => T): T {
     if (this.db.isTransaction) return fn();
@@ -148,6 +261,7 @@ export class Store {
     return this.db
       .prepare(`SELECT c.id,c.name,c.instance,c.managed,c.overflow,c.state,c.number,
       c.signal_configured,c.webhook_configured,c.last_sync,c.created_at,
+      c.profile_name,c.profile_synced_at,(c.profile_photo IS NOT NULL) AS has_photo,
       (SELECT count(*) FROM contacts WHERE connection_id=c.id) AS contacts,
       (SELECT count(*) FROM contacts WHERE connection_id=c.id AND ignored=1) AS ignored,
       (SELECT count(*) FROM deliveries WHERE connection_id=c.id AND status IN ('pending','processing')) AS pending,
@@ -158,7 +272,7 @@ export class Store {
   setOverflow(id: string, enabled: boolean, actor: string) {
     this.transaction(() => {
       const c = this.connection(id);
-      if (enabled && (!c.signal_configured || !c.webhook_configured))
+      if (enabled && (!this.signalUrl(c) || !c.webhook_configured))
         throw new AppError(409, "CONNECTION_SETUP_REQUIRED");
       this.db
         .prepare("UPDATE connections SET overflow=?,enabled_at=? WHERE id=?")
@@ -170,11 +284,11 @@ export class Store {
       if (!enabled) {
         this.db
           .prepare(`UPDATE deliveries SET status='ignored',payload=NULL,last_error='OVERFLOW_DISABLED'
-          WHERE connection_id=? AND status='pending'`)
+          WHERE connection_id=? AND status='pending' AND event<>'DEVICE_UPDATE'`)
           .run(id);
         this.db
           .prepare(`UPDATE deliveries SET last_error='OVERFLOW_DISABLED'
-          WHERE connection_id=? AND status='processing'`)
+          WHERE connection_id=? AND status='processing' AND event<>'DEVICE_UPDATE'`)
           .run(id);
       }
       this.audit(actor, enabled ? "overflow.enabled" : "overflow.disabled", id);
@@ -282,7 +396,9 @@ export class Store {
     const current = this.db.prepare("SELECT last_error FROM deliveries WHERE id=?").get(id);
     if (
       status !== "delivered" &&
-      ["OVERFLOW_DISABLED", "CONTACT_IGNORED"].includes(String(current?.last_error))
+      ["OVERFLOW_DISABLED", "CONTACT_IGNORED", "DESTINATION_CHANGED"].includes(
+        String(current?.last_error),
+      )
     ) {
       status = "ignored";
       error = String(current?.last_error);

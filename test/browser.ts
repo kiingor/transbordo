@@ -41,6 +41,24 @@ const { app, dispatcher } = await buildApp(config, {
       return provisioned.has(instance)
         ? Response.json({ instance: { state: "open" } })
         : new Response("{}", { status: 404 });
+    if (url.includes("fetchInstances"))
+      return Response.json([
+        {
+          name: new URL(url).searchParams.get("instanceName"),
+          profileName: "Perfil sincronizado",
+          ownerJid: "5583999990000@s.whatsapp.net",
+          connectionStatus: "open",
+          profilePicUrl: "https://photo.example.test/profile.png",
+        },
+      ]);
+    if (url.startsWith("https://photo.example.test/"))
+      return new Response(
+        Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jf0cAAAAASUVORK5CYII=",
+          "base64",
+        ),
+        { headers: { "content-type": "image/png" } },
+      );
     if (url.includes("findContacts"))
       return Response.json([
         { remoteJid: "5583999990001@s.whatsapp.net", pushName: "Contato de teste" },
@@ -55,14 +73,9 @@ for (const [index, name] of ["Atendimento comercial", "Suporte técnico", "Finan
     evolutionKey: "test-only-instance-key",
   });
   provisioned.add(c.instance);
-  store.setSecrets(c, {
-    ...store.secrets(c),
-    signalUrl: `https://signal.example.test/webhooks/evolution/channel-public-id/${"s".repeat(43)}`,
-  });
   store.db
     .prepare("UPDATE connections SET webhook_configured=1,state='open',number=? WHERE id=?")
     .run(`558399999000${index}`, c.id);
-  if (index !== 2) store.setOverflow(c.id, true, "admin");
   for (const [n, contact] of [
     "Ana · teste",
     "Bruno · teste",
@@ -104,8 +117,24 @@ try {
   await page.getByLabel("E-mail", { exact: true }).fill("admin@example.test");
   await page.getByLabel("Senha", { exact: true }).fill("browser-test-password");
   await page.getByRole("button", { name: "Entrar no portal" }).click();
-  await expect(page.getByRole("heading", { name: "Seus números" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Seus dispositivos" })).toBeVisible();
   await expect(page.locator(".connection-card")).toHaveCount(3);
+  await page.getByText("Configurar conexão com o Signal", { exact: true }).click();
+  await expect(page.getByLabel("URL da plataforma", { exact: true })).toHaveValue(
+    `${config.PUBLIC_URL}/platform`,
+  );
+  await page
+    .getByLabel("Webhook único do Signal")
+    .fill(`https://signal.example.test/webhooks/evolution/channel-public-id/${"s".repeat(43)}`);
+  await page.getByRole("button", { name: "Salvar conexão da plataforma" }).click();
+  await expect(
+    page.getByText("Conexão da plataforma com o Signal configurada.", { exact: true }),
+  ).toBeVisible();
+  await page.getByText("Configurar conexão com o Signal", { exact: true }).click();
+  await page
+    .getByRole("switch", { name: "Transbordo de Atendimento comercial", exact: true })
+    .click();
+  await page.getByRole("switch", { name: "Transbordo de Suporte técnico", exact: true }).click();
   await screenshot("desktop.png");
   const toggle = page.getByRole("switch", {
     name: "Transbordo de Atendimento comercial",
@@ -116,7 +145,7 @@ try {
   await page
     .locator(".connection-card")
     .filter({ hasText: "Atendimento comercial" })
-    .getByRole("button", { name: "Gerenciar conexão" })
+    .getByRole("button", { name: "Gerenciar dispositivo" })
     .click();
   await expect(page.getByRole("heading", { name: "Quem pode chegar ao Signal?" })).toBeVisible();
   await page.getByRole("switch", { name: "Ignorar Ana · teste" }).click();
@@ -139,28 +168,37 @@ try {
   await page.getByLabel("Número com DDI e DDD").fill("5583999997777");
   await page.getByRole("button", { name: "Ignorar contato", exact: true }).click();
   await expect(page.getByText("Número adicionado à lista de ignorados.")).toBeVisible();
-  await page.getByRole("button", { name: "Todos os números" }).click();
-  await page.getByRole("button", { name: "Adicionar número", exact: true }).click();
-  await page.getByLabel("Nome da conexão").fill("Novo número de teste");
-  await page.getByRole("button", { name: "Criar conexão" }).click();
+  await page.getByRole("button", { name: "Todos os dispositivos" }).click();
+  await page.getByRole("button", { name: "Adicionar dispositivo", exact: true }).click();
+  await page.getByLabel("Nome do dispositivo").fill("Novo número de teste");
+  await page.getByRole("button", { name: "Criar dispositivo" }).click();
   await expect(
     page.getByRole("heading", { name: "Novo número de teste", exact: true }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Conectar WhatsApp", exact: true }).click();
   await expect(page.getByText("Recebimento de webhooks configurado")).toBeVisible();
-  await page
-    .getByLabel("Webhook gerado pelo Signal")
-    .fill(`https://signal.example.test/webhooks/evolution/channel-public-id/${"s".repeat(43)}`);
-  await page.getByRole("button", { name: "Salvar webhook" }).click();
+  await expect(page.getByLabel("Webhook único do Signal")).toHaveCount(0);
+  await page.getByRole("button", { name: "Sincronizar perfil", exact: true }).click();
+  await expect(page.getByText("Nome e foto do dispositivo sincronizados.")).toBeVisible();
   await expect(
-    page.getByText("Webhook do Signal salvo. Você já pode ativar o transbordo."),
+    page.getByRole("heading", { name: "Perfil sincronizado", exact: true }),
   ).toBeVisible();
+  await expect(page.getByAltText("Foto de Perfil sincronizado").first()).toBeVisible();
+  await expect
+    .poll(() =>
+      page
+        .getByAltText("Foto de Perfil sincronizado")
+        .first()
+        .evaluate((img) => (img as HTMLImageElement).naturalWidth),
+    )
+    .toBeGreaterThan(0);
+  await screenshot("device-profile.png");
   await page.getByRole("switch", { name: "Ativar transbordo", exact: true }).click();
   await expect(
     page.getByRole("switch", { name: "Ativar transbordo", exact: true }),
   ).toHaveAttribute("aria-checked", "true");
   await dispatcher.tick();
-  await page.getByRole("button", { name: "Todos os números" }).click();
+  await page.getByRole("button", { name: "Todos os dispositivos" }).click();
   await page.setViewportSize({ width: 390, height: 844 });
   await screenshot("mobile.png");
   if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth))
@@ -180,7 +218,7 @@ try {
   await expect(page.getByRole("heading", { name: "Bem-vindo de volta" })).toBeVisible();
   if (failures.length) throw new Error(failures.join("\n"));
   console.log(
-    "Browser checks passed: login, number isolation, pause, contacts, sync, new connection, Signal setup, mobile layout, team and logout.",
+    "Browser checks passed: login, shared platform setup, device isolation, pause, contacts, profile/photo sync, new device, mobile layout, team and logout.",
   );
   console.log(`Simulated upstream calls: ${upstream.length}. No real messages sent.`);
 } finally {
