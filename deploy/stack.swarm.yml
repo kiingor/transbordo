@@ -5,6 +5,7 @@ services:
     environment:
       NODE_ENV: production
       HOST: 0.0.0.0
+      TRUST_PROXY: ${PROXY_CIDR:?Defina PROXY_CIDR}
       PORT: 3080
       DATABASE_PATH: /app/data/portal.sqlite
       PUBLIC_URL: https://${PORTAL_DOMAIN:?Defina PORTAL_DOMAIN}

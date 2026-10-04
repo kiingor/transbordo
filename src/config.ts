@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { readFileSync } from "node:fs";
+import { isIP } from "node:net";
 
 const url = z.url().refine((value) => {
   const u = new URL(value);
@@ -13,6 +14,23 @@ export const configSchema = z
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
     PORT: z.coerce.number().int().min(1).max(65535).default(3080),
     HOST: z.string().default("127.0.0.1"),
+    TRUST_PROXY: z
+      .string()
+      .default("127.0.0.1")
+      .refine(
+        (value) =>
+          value.split(",").every((entry) => {
+            const [address, prefix, extra] = entry.trim().split("/");
+            const family = isIP(address ?? "");
+            return (
+              family !== 0 &&
+              extra === undefined &&
+              (prefix === undefined ||
+                (/^\d+$/.test(prefix) && Number(prefix) <= (family === 4 ? 32 : 128)))
+            );
+          }),
+        "Informe apenas IPs ou redes CIDR dos proxies, separados por vírgula",
+      ),
     PUBLIC_URL: url.default("http://localhost:3080"),
     DATABASE_PATH: z.string().default("./data/portal.sqlite"),
     ENCRYPTION_KEY: z

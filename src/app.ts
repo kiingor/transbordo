@@ -49,8 +49,11 @@ export async function buildApp(
     logController: new LogController({ disableRequestLogging: true }),
     bodyLimit: 24 * 1024 * 1024,
     requestTimeout: 35_000,
-    // Reverse proxy forwards to loopback; headers from untrusted clients never establish identity.
-    trustProxy: config.NODE_ENV === "production" ? "127.0.0.1" : false,
+    // Trust only deployment-owned proxy addresses, never arbitrary forwarded headers.
+    trustProxy:
+      config.NODE_ENV === "production"
+        ? config.TRUST_PROXY.split(",").map((address) => address.trim())
+        : false,
   });
   await app.register(helmet, {
     contentSecurityPolicy: {

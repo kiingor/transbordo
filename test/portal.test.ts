@@ -472,3 +472,29 @@ test("an unresolved LID cannot bypass a configured contact exclusion", async (t)
     "IDENTITY_UNRESOLVED",
   );
 });
+
+test("production login rate limits use the client IP only through the configured proxy", async (t) => {
+  const production = configSchema.parse({
+    ...config,
+    NODE_ENV: "production",
+    PUBLIC_URL: "https://portal.example.test",
+    TRUST_PROXY: "10.0.1.0/24",
+  });
+  const { app } = await buildApp(production, { logger: false });
+  t.after(() => app.close());
+  const attempt = (remoteAddress: string, forwardedFor: string) =>
+    app.inject({
+      method: "POST",
+      url: "/api/login",
+      remoteAddress,
+      headers: { origin: production.PUBLIC_URL, "x-forwarded-for": forwardedFor },
+      payload: { email: "absent@example.test", password: "incorrect" },
+    });
+  for (let i = 0; i < 8; i++)
+    assert.equal((await attempt("10.0.1.7", "198.51.100.10")).statusCode, 401);
+  assert.equal((await attempt("10.0.1.7", "198.51.100.10")).statusCode, 429);
+  assert.equal((await attempt("10.0.1.7", "198.51.100.11")).statusCode, 401);
+  for (let i = 0; i < 8; i++)
+    assert.equal((await attempt("198.51.100.12", `203.0.113.${i}`)).statusCode, 401);
+  assert.equal((await attempt("198.51.100.12", "203.0.113.200")).statusCode, 429);
+});

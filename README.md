@@ -31,6 +31,7 @@ Copie a chave gerada para `ENCRYPTION_KEY` no `.env`. Configure:
 | `EVOLUTION_URL` | URL base da Evolution 2.x. |
 | `EVOLUTION_API_KEY` | Chave global, usada somente para provisionar novas instâncias. |
 | `SIGNAL_API_ORIGIN` | Origem da **API** do Signal, sem caminho, distinta do painel. |
+| `TRUST_PROXY` | IPs/CIDRs dos proxies, separados por vírgula. Em Swarm, use a sub-rede do proxy; não confie em redes de clientes. |
 | `BOOTSTRAP_EMAIL`, `BOOTSTRAP_PASSWORD` | Primeiro administrador; senha com pelo menos 12 caracteres. |
 
 ```sh
@@ -92,9 +93,10 @@ A homologação com QR real, mensagens/mídias reais e a versão instalada na VP
 
 ## Instalar na VPS
 
-A instalação não foi executada nesta sessão: o trabalho ficou local a pedido do usuário.
 Verifique os serviços, portas e proxy existentes na VPS antes de instalar. Reutilize a Evolution já instalada;
 se ausente, instale-a em uma stack independente conforme a documentação oficial.
+
+### Docker Compose
 
 1. Copie o projeto para uma pasta própria, por exemplo `/opt/softcom-transbordo`.
 2. Prepare `.env` fora do Git com a chave de cifragem, URLs HTTPS, credenciais Evolution e usuário de bootstrap.
@@ -103,6 +105,27 @@ se ausente, instale-a em uma stack independente conforme a documentação oficia
 5. Remova `BOOTSTRAP_PASSWORD` do `.env` e execute `docker compose -f deploy/compose.yml up -d`.
 6. Configure o proxy existente para `127.0.0.1:3080`. `deploy/Caddyfile.example` é um exemplo de TLS automático.
 7. Valide `/health`, login, QR, contato ignorado, transbordo pausado e resposta de texto/mídia antes de ativar números reais.
+
+### Docker Swarm com Traefik
+
+Use `deploy/stack.swarm.yml` quando o servidor já possui Swarm e Traefik. O manifesto reutiliza
+a rede e o resolvedor TLS existentes e não publica uma porta extra no host.
+
+1. Construa a imagem no nó de execução e identifique-a pelo commit, por exemplo `docker build -t softcom-transbordo:<commit> .`.
+2. Crie `/opt/softcom-transbordo/data`, proprietário UID/GID `1000:1000`, modo `0700`.
+3. Crie os secrets externos `softcom_transbordo_encryption_v1` (chave de cifragem base64) e
+   `softcom_transbordo_evolution_v1` (chave global Evolution), lendo arquivos protegidos ou stdin.
+   Não coloque os valores na linha de comando, no manifesto ou no Git. Guarde a chave de cifragem para backup.
+4. Exporte `PORTAL_IMAGE`, `PORTAL_DOMAIN`, `EVOLUTION_URL`, `SIGNAL_API_ORIGIN`, `PORTAL_NODE`,
+   `PROXY_NETWORK`, `PROXY_CIDR` e `TLS_RESOLVER`. `PORTAL_DOMAIN` contém somente o domínio, sem `https://`.
+   Aponte o DNS para a VPS antes da publicação. A imagem local exige que `PORTAL_NODE` seja o nó onde ela foi construída.
+5. Aplique `docker stack deploy --resolve-image never -c deploy/stack.swarm.yml softcom-transbordo`.
+6. Execute `node dist/server/bootstrap.js` em um container com os mesmos secrets e volume,
+   passando `BOOTSTRAP_EMAIL` e `BOOTSTRAP_PASSWORD` por ambiente protegido. Não recrie o banco nem os secrets em atualizações.
+7. Confira uma réplica saudável, HTTPS, login e `/health`. Conecte os números explicitamente pelo portal.
+
+O aplicativo lê `ENCRYPTION_KEY_FILE` e `EVOLUTION_API_KEY_FILE` em `/run/secrets` no Swarm;
+esses arquivos têm prioridade sobre os valores de ambiente correspondentes.
 
 Execute **uma réplica** do portal por banco SQLite/volume. Faça backup consistente do banco com
 `node:sqlite.backup` ou com o serviço parado; não copie apenas o arquivo principal enquanto WAL está ativo.
