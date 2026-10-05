@@ -25,6 +25,7 @@ export interface Connection {
   last_sync: number | null;
   created_at: number;
   enabled_at: number | null;
+  created_by: string | null;
 }
 export interface Secrets {
   evolutionKey: string;
@@ -79,7 +80,7 @@ export class Store {
     this.db = new DatabaseSync(path);
     this.vault = new Vault(Buffer.from(key, "base64"));
     const version = Number(this.db.prepare("PRAGMA user_version").get()?.user_version);
-    if (version > 3) {
+    if (version > 4) {
       this.db.close();
       throw new Error("DATABASE_VERSION_UNSUPPORTED");
     }
@@ -138,13 +139,20 @@ export class Store {
           UPDATE contacts SET enabled_at=(SELECT enabled_at FROM connections
             WHERE id=contacts.connection_id AND overflow=1) WHERE ignored=0;`);
       }
+      if (version < 4) {
+        this.db.exec(`ALTER TABLE connections ADD COLUMN created_by TEXT REFERENCES users(id);
+          UPDATE connections SET created_by=(SELECT a.actor FROM audit a JOIN users u ON u.id=a.actor
+            WHERE a.connection_id=connections.id AND a.action='connection.created'
+            ORDER BY a.created_at,a.id LIMIT 1);
+          CREATE INDEX connections_creator ON connections(created_by);`);
+      }
       if (!this.db.prepare("SELECT 1 FROM platform WHERE singleton=1").get()) {
         const id = randomUUID();
         this.db
           .prepare("INSERT INTO platform(singleton,id,secrets) VALUES(1,?,?)")
           .run(id, this.vault.seal({ apiKey: token() }, `platform:${id}`));
       }
-      this.db.exec("PRAGMA user_version=3");
+      this.db.exec("PRAGMA user_version=4");
     });
   }
   platform(): Platform {
@@ -245,6 +253,14 @@ export class Store {
     if (this.removing.has(id)) throw new AppError(409, "DEVICE_REMOVING");
     return row;
   }
+  userConnection(id: string, user: User): Connection {
+    if (
+      user.role !== "admin" &&
+      !this.db.prepare("SELECT 1 FROM connections WHERE id=? AND created_by=?").get(id, user.id)
+    )
+      throw new AppError(404, "CONNECTION_NOT_FOUND");
+    return this.connection(id);
+  }
   beginRemoval(id: string, actor: string): Connection {
     const c = this.connection(id);
     this.transaction(() => {
@@ -284,15 +300,18 @@ export class Store {
       .prepare("UPDATE connections SET secrets=?, signal_configured=? WHERE id=?")
       .run(this.vault.seal(secrets, c.id), secrets.signalUrl ? 1 : 0, c.id);
   }
-  createConnection(input: { name: string; instance?: string; evolutionKey?: string }) {
+  createConnection(
+    input: { name: string; instance?: string; evolutionKey?: string },
+    createdBy: string | null = null,
+  ) {
     const id = randomUUID();
     const instance = input.instance ?? `portal-${id}`;
     const bridgeKey = token(),
       webhookToken = token();
     const secrets: Secrets = { evolutionKey: input.evolutionKey ?? token(), webhookToken };
     this.db
-      .prepare(`INSERT INTO connections(id,name,instance,managed,secrets,bridge_hash,webhook_hash,created_at)
-      VALUES(?,?,?,?,?,?,?,?)`)
+      .prepare(`INSERT INTO connections(id,name,instance,managed,secrets,bridge_hash,webhook_hash,created_at,created_by)
+      VALUES(?,?,?,?,?,?,?,?,?)`)
       .run(
         id,
         input.name,
@@ -302,10 +321,11 @@ export class Store {
         digest(bridgeKey),
         digest(webhookToken),
         Date.now(),
+        createdBy,
       );
     return { connection: this.connection(id), bridgeKey };
   }
-  listConnections() {
+  listConnections(user?: User) {
     return this.db
       .prepare(`SELECT c.id,c.name,c.instance,c.managed,c.overflow,c.state,c.number,
       c.signal_configured,c.webhook_configured,c.last_sync,c.created_at,
@@ -315,8 +335,8 @@ export class Store {
       (SELECT count(*) FROM contacts WHERE connection_id=c.id AND overflow=1 AND ignored=0) AS individual,
       (SELECT count(*) FROM deliveries WHERE connection_id=c.id AND status IN ('pending','processing')) AS pending,
       (SELECT count(*) FROM deliveries WHERE connection_id=c.id AND status='failed') AS failed
-      FROM connections c ORDER BY c.created_at DESC`)
-      .all();
+      FROM connections c ${user?.role === "operator" ? "WHERE c.created_by=?" : ""} ORDER BY c.created_at DESC`)
+      .all(...(user?.role === "operator" ? [user.id] : []));
   }
   setOverflow(id: string, enabled: boolean, actor: string) {
     this.transaction(() => {

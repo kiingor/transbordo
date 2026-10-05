@@ -303,20 +303,60 @@ try {
   await page.getByLabel("E-mail", { exact: true }).fill("operator@example.test");
   await page.getByLabel("Senha", { exact: true }).fill("operator-test-password");
   await page.getByRole("button", { name: "Entrar no portal" }).click();
-  await page
-    .locator(".connection-card")
-    .first()
-    .getByRole("button", { name: "Gerenciar dispositivo" })
-    .click();
-  await expect(page.getByRole("heading", { name: "Quem pode chegar ao Signal?" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Dispositivo e perfil" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Seus dispositivos" })).toBeVisible();
+  await expect(page.locator(".connection-card")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Equipe", exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "Adicionar dispositivo", exact: true }).first().click();
+  await page.getByLabel("Nome do dispositivo").fill("Dispositivo do operador");
+  await page.getByRole("button", { name: "Criar dispositivo" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Dispositivo do operador", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Conectar WhatsApp", exact: true }).click();
+  await expect(page.getByText("Recebimento de webhooks configurado")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Dispositivo e perfil" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Remover dispositivo", exact: true })).toHaveCount(
     0,
   );
+  await page.getByRole("button", { name: "Contatos e exceções" }).click();
+  await expect(page.getByRole("heading", { name: "Quem pode chegar ao Signal?" })).toBeVisible();
+  await page.getByRole("button", { name: "Todos os dispositivos" }).click();
+  await expect(page.locator(".connection-card")).toHaveCount(1);
+  await expect(page.getByText("Atendimento comercial", { exact: true })).toHaveCount(0);
+  await screenshot("operator-owned-devices.png");
+  await page.getByTitle("Alterar minha senha", { exact: true }).click();
+  const passwordDialog = page.getByRole("dialog", { name: "Alterar minha senha" });
+  await passwordDialog.getByLabel("Senha atual", { exact: true }).fill("operator-test-password");
+  await passwordDialog.getByLabel("Nova senha", { exact: true }).fill("updated-operator-password");
+  await passwordDialog
+    .getByLabel("Confirmar nova senha", { exact: true })
+    .fill("mistyped-operator-password");
+  await passwordDialog.getByRole("button", { name: "Salvar senha" }).click();
+  await expect(
+    passwordDialog.getByText("A confirmação não corresponde à nova senha."),
+  ).toBeVisible();
+  await passwordDialog
+    .getByLabel("Confirmar nova senha", { exact: true })
+    .fill("updated-operator-password");
+  await passwordDialog.getByRole("button", { name: "Salvar senha" }).click();
+  await expect(page.getByRole("heading", { name: "Bem-vindo de volta" })).toBeVisible();
+  await expect(page.getByRole("status")).toHaveText(
+    "Senha alterada com sucesso. Entre com a nova senha.",
+  );
+  await screenshot("password-changed.png");
+  await page.getByLabel("E-mail", { exact: true }).fill("operator@example.test");
+  await page.getByLabel("Senha", { exact: true }).fill("updated-operator-password");
+  await page.getByRole("button", { name: "Entrar no portal" }).click();
+  await expect(page.locator(".connection-card")).toHaveCount(1);
+  await page.getByRole("button", { name: "Sair", exact: true }).click();
+  await page.getByLabel("E-mail", { exact: true }).fill("admin@example.test");
+  await page.getByLabel("Senha", { exact: true }).fill("browser-test-password");
+  await page.getByRole("button", { name: "Entrar no portal" }).click();
+  await expect(page.locator(".connection-card")).toHaveCount(4);
   await page.getByRole("button", { name: "Sair", exact: true }).click();
   if (failures.length) throw new Error(failures.join("\n"));
   console.log(
-    "Browser checks passed: login, shared platform setup, device isolation, individual/general contact overflow, ignore precedence, contact filters, profile/photo sync, new device, removal/cancel, operator restrictions, mobile layout, team and logout.",
+    "Browser checks passed: login, shared platform setup, individual/general contact overflow, ignore precedence, contact filters, profile/photo sync, new device, removal/cancel, operator ownership and creation, password confirmation/change/login, admin visibility, mobile layout, team and logout.",
   );
   console.log(`Simulated upstream calls: ${upstream.length}. No real messages sent.`);
 } finally {

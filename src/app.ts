@@ -127,7 +127,11 @@ export async function buildApp(
   await app.register(async (api) => {
     api.addHook("onRequest", async (request) => {
       csrf(request);
-      if (request.routeOptions.url !== "/api/login") session(request);
+      if (request.routeOptions.url !== "/api/login") {
+        const user = session(request);
+        if (request.routeOptions.url?.startsWith("/api/connections/:id"))
+          store.userConnection((request.params as { id: string }).id, user);
+      }
     });
     api.post(
       "/api/login",
@@ -165,7 +169,7 @@ export async function buildApp(
         signal: !!config.SIGNAL_API_ORIGIN,
       },
     }));
-    api.post("/api/password", { bodyLimit: 4096 }, async (request) => {
+    api.post("/api/password", { bodyLimit: 4096 }, async (request, reply) => {
       const user = session(request);
       const body = z
         .object({ current: z.string().max(256), password: z.string().min(12).max(256) })
@@ -179,6 +183,7 @@ export async function buildApp(
         store.db.prepare("DELETE FROM sessions WHERE user_id=?").run(user.id);
         store.audit(user.id, "password.changed");
       });
+      reply.header("set-cookie", cookie("", 0));
       return { ok: true };
     });
     api.get("/api/users", async (request) => {
@@ -212,7 +217,9 @@ export async function buildApp(
       });
       return { ok: true };
     });
-    api.get("/api/connections", async () => ({ connections: store.listConnections() }));
+    api.get("/api/connections", async (request) => ({
+      connections: store.listConnections(session(request)),
+    }));
     api.get("/api/platform", async (request) => {
       const user = session(request),
         platform = store.platform();
@@ -243,17 +250,20 @@ export async function buildApp(
       evolution.syncProfile(store.connection(request.params.id)),
     );
     api.post("/api/connections", { bodyLimit: 8192 }, async (request, reply) => {
-      const user = admin(request),
+      const user = session(request),
         body = newConnection.parse(request.body);
       if (!config.EVOLUTION_URL || (!body.instance && !config.EVOLUTION_API_KEY))
         throw new AppError(503, "EVOLUTION_NOT_CONFIGURED");
-      const created = store.createConnection(body);
-      store.audit(user.id, "connection.created", created.connection.id);
-      store.queueDeviceUpdate(created.connection.id);
+      const created = store.transaction(() => {
+        const result = store.createConnection(body, user.id);
+        store.audit(user.id, "connection.created", result.connection.id);
+        store.queueDeviceUpdate(result.connection.id);
+        return result;
+      });
       reply.code(201);
       return {
         id: created.connection.id,
-        ...integration(created.connection.id, created.bridgeKey),
+        ...(user.role === "admin" ? integration(created.connection.id, created.bridgeKey) : {}),
       };
     });
     api.patch<{ Params: { id: string } }>(
@@ -269,7 +279,7 @@ export async function buildApp(
           })
           .strict()
           .parse(request.body);
-        if ((body.name !== undefined || body.signalUrl !== undefined) && user.role !== "admin")
+        if (body.signalUrl !== undefined && user.role !== "admin")
           throw new AppError(403, "ADMIN_REQUIRED");
         const c = store.connection(request.params.id);
         store.transaction(() => {
@@ -320,7 +330,7 @@ export async function buildApp(
       return integration(c.id, key);
     });
     api.post<{ Params: { id: string } }>("/api/connections/:id/connect", async (request) => {
-      const user = admin(request),
+      const user = session(request),
         c = store.connection(request.params.id);
       const result = await evolution.connect(c);
       store.audit(user.id, "connection.webhook_installed", c.id);
@@ -330,7 +340,6 @@ export async function buildApp(
       evolution.status(store.connection(request.params.id)),
     );
     api.get<{ Params: { id: string } }>("/api/connections/:id/qr", async (request) => {
-      admin(request);
       return evolution.pair(store.connection(request.params.id));
     });
     api.post<{ Params: { id: string } }>("/api/connections/:id/sync", async (request) => {
@@ -395,18 +404,38 @@ export async function buildApp(
       return { ok: true };
     });
     api.get("/api/activity", async (request) => {
+      const user = session(request);
       const { connectionId } = z.object({ connectionId: z.uuid().optional() }).parse(request.query);
+      if (connectionId) store.userConnection(connectionId, user);
+      const deviceFilters = [
+        ...(user.role === "operator" ? ["c.created_by=?"] : []),
+        ...(connectionId ? ["c.id=?"] : []),
+      ];
+      const deviceParams = [
+        ...(user.role === "operator" ? [user.id] : []),
+        ...(connectionId ? [connectionId] : []),
+      ];
+      const auditFilters = [
+        ...(user.role === "operator"
+          ? ["(c.created_by=? OR (a.connection_id IS NULL AND a.actor=?))"]
+          : []),
+        ...(connectionId ? ["a.connection_id=?"] : []),
+      ];
       return {
         deliveries: store.db
           .prepare(`SELECT d.id,d.connection_id,c.name,d.event,d.status,d.attempts,d.last_error,d.created_at
         FROM deliveries d JOIN connections c ON c.id=d.connection_id
-        ${connectionId ? "WHERE c.id=?" : ""} ORDER BY d.created_at DESC LIMIT 100`)
-          .all(...(connectionId ? [connectionId] : [])),
+        ${deviceFilters.length ? `WHERE ${deviceFilters.join(" AND ")}` : ""} ORDER BY d.created_at DESC LIMIT 100`)
+          .all(...deviceParams),
         audit: store.db
           .prepare(`SELECT a.id,COALESCE(u.name,'Sistema') AS actor,a.action,c.name,a.created_at
           FROM audit a LEFT JOIN users u ON u.id=a.actor LEFT JOIN connections c ON c.id=a.connection_id
+          ${auditFilters.length ? `WHERE ${auditFilters.join(" AND ")}` : ""}
           ORDER BY a.created_at DESC LIMIT 50`)
-          .all(),
+          .all(
+            ...(user.role === "operator" ? [user.id, user.id] : []),
+            ...(connectionId ? [connectionId] : []),
+          ),
       };
     });
   });

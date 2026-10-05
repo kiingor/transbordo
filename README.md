@@ -6,6 +6,7 @@ O repositório e o banco são próprios. Não há acesso direto ao banco do Sign
 ## O que está implementado
 
 - Login por pessoa, perfis administrador e operador e revogação de sessões.
+- Dispositivos vinculados ao usuário que os adicionou. Operadores veem e gerenciam apenas os próprios; administradores veem todos.
 - Novas instâncias Evolution por QR Code ou vinculação de uma instância existente com sua chave.
 - Uma conexão da plataforma com um único canal no Signal; vários dispositivos sob essa conexão.
 - Transbordo geral por dispositivo e ativação individual por contato, ambos desligados por padrão.
@@ -45,6 +46,8 @@ npm start
 
 Abra `http://localhost:3080`. Depois do bootstrap, remova a senha de bootstrap do `.env`.
 O bootstrap não sobrescreve usuários existentes. Novas pessoas são cadastradas na tela Equipe.
+Em **Alterar minha senha**, informe a senha atual, a nova senha e a confirmação. Ao salvar,
+o portal confirma a alteração e pede um novo login; todas as sessões anteriores desse usuário são encerradas.
 Sem Evolution/Signal configurados, o login e o painel funcionam; o cadastro de números informa a configuração faltante.
 
 Para desenvolvimento com provedores simulados no loopback, use `ALLOW_PRIVATE_NETWORKS=true`
@@ -74,7 +77,13 @@ Todos os dispositivos usam o mesmo canal, inclusive os adicionados depois. O cat
 `/platform/devices` permite ao Signal exibir os nomes, números e fotos. Perfis são atualizados a
 cada cinco minutos e também no pareamento ou pelo botão **Sincronizar perfil**. Se a lista de instâncias
 da Evolution não informar o nome, o portal consulta o perfil do próprio número em `chat/fetchProfile`. A chave só aparece
-para administradores; operadores podem controlar transbordo e contatos.
+para administradores; operadores podem adicionar dispositivos, conectar por QR Code, sincronizar
+perfil/contatos e controlar o transbordo apenas dos aparelhos que cadastraram. A criação vincula
+automaticamente o usuário da sessão; o cliente não pode escolher nem alterar esse vínculo.
+
+Listagem, contagem, fotos, contatos, QR Code e histórico respeitam o mesmo acesso no servidor.
+Consultar ou alterar um dispositivo de outra pessoa retorna 404. A integração global, chaves,
+gestão de usuários e remoção de dispositivos continuam restritas a administradores.
 
 O Signal não reinicia nem exclui dispositivos externos. QR e pareamento pertencem ao portal.
 O portal permite apenas operações necessárias ao transporte. Envios sem dispositivo são recusados;
@@ -97,11 +106,15 @@ pausado para permitir nova tentativa. Instância já ausente (404) não impede a
 
 ### Atualização de uma instalação anterior
 
-Faça backup consistente do SQLite e preserve a chave de cifragem. A migração para schema 3 é
+Faça backup consistente do SQLite e preserve a chave de cifragem. A migração para schema 4 é
 transacional e preserva usuários, dispositivos, contatos, exclusões, fila e estado do transbordo geral.
-A ativação individual começa desligada para todos os contatos existentes. A atualização a partir
+A atualização a partir dos schemas 1/2 inicia a ativação individual desligada para os contatos;
+escolhas individuais já existentes no schema 3 são preservadas. A atualização a partir
 do schema 1 também gera a identidade e chave globais estáveis do schema 2; instalações v2 preservam ambas.
-Versões antigas do portal não abrem o schema 3: um rollback exige a imagem e o backup anteriores juntos.
+O schema 4 recupera o criador de cada dispositivo pelo primeiro registro válido de criação na auditoria.
+Quando não existe esse registro, somente administradores têm acesso ao dispositivo. O vínculo
+fica persistido independentemente da retenção posterior do histórico.
+Versões antigas do portal não abrem o schema 4: um rollback exige a imagem e o backup anteriores juntos.
 Bridges individuais antigos continuam compatíveis até a configuração do
 webhook global. Para migrar, pause os dispositivos, configure o único canal da plataforma e então
 reative os aparelhos desejados. Alterar o webhook exige o geral desligado e nenhuma ativação individual efetiva; descarta pendências do

@@ -395,9 +395,10 @@ for (const version of [1, 2])
       legacy.exec(
         `ALTER TABLE contacts DROP COLUMN overflow; ALTER TABLE contacts DROP COLUMN enabled_at; PRAGMA user_version=${version}`,
       );
+      legacy.exec("DROP INDEX connections_creator; ALTER TABLE connections DROP COLUMN created_by");
       legacy.close();
       store = new Store(path, config.ENCRYPTION_KEY);
-      assert.equal(store.db.prepare("PRAGMA user_version").get()?.user_version, 3);
+      assert.equal(store.db.prepare("PRAGMA user_version").get()?.user_version, 4);
       assert.equal(
         store.db.prepare("SELECT count(*) AS n FROM contacts WHERE overflow<>0").get()?.n,
         0,
@@ -465,11 +466,14 @@ async function fixture(t: TestContext, custom?: Transport) {
   assert.equal(login.statusCode, 200, login.body);
   const cookie = login.cookies[0]!;
   const headers = { origin: config.PUBLIC_URL, cookie: `${cookie.name}=${cookie.value}` };
-  const created = store.createConnection({
-    name: "Atendimento",
-    instance: "number-one",
-    evolutionKey: "instance-test-key-only",
-  });
+  const created = store.createConnection(
+    {
+      name: "Atendimento",
+      instance: "number-one",
+      evolutionKey: "instance-test-key-only",
+    },
+    "operator",
+  );
   store.setSecrets(created.connection, { ...store.secrets(created.connection), signalUrl });
   store.db
     .prepare("UPDATE connections SET webhook_configured=1 WHERE id=?")
@@ -524,7 +528,7 @@ test("login requires same origin, isolates admin operations and never exposes cr
   const cookie = operator.cookies[0]!;
   const denied = await f.app.inject({
     method: "POST",
-    url: "/api/connections",
+    url: "/api/users",
     headers: { ...f.headers, cookie: `${cookie.name}=${cookie.value}` },
     payload: { name: "Outro número" },
   });

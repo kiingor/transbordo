@@ -115,7 +115,7 @@ const errors: Record<string, string> = {
   ADMIN_REQUIRED: "Essa configuração requer um administrador.",
   CANNOT_DISABLE_SELF: "Você não pode desativar seu próprio acesso.",
   DEVICE_REMOVING: "Este dispositivo está sendo removido. Aguarde a conclusão.",
-  CONNECTION_NOT_FOUND: "Este dispositivo já foi removido. Volte à lista de dispositivos.",
+  CONNECTION_NOT_FOUND: "Dispositivo não encontrado ou sem acesso. Volte à lista de dispositivos.",
   EVOLUTION_REMOVE_FAILED:
     "Não foi possível concluir a remoção na Evolution. O transbordo ficou pausado; tente remover novamente.",
 };
@@ -302,7 +302,7 @@ function CopyField({
   );
 }
 
-function Login({ done }: { done: (u: User) => void }) {
+function Login({ done, message }: { done: (u: User) => void; message?: string }) {
   const [error, setError] = useState(""),
     [busy, setBusy] = useState(false);
   async function submit(e: FormEvent<HTMLFormElement>) {
@@ -352,6 +352,11 @@ function Login({ done }: { done: (u: User) => void }) {
           <span className="eyebrow">PORTAL DE CONEXÕES</span>
           <h2>Bem-vindo de volta</h2>
           <p>Entre para gerenciar o transbordo da sua equipe.</p>
+          {message && (
+            <div className="notice success" role="status">
+              {message}
+            </div>
+          )}
           <label>
             E-mail
             <input
@@ -395,21 +400,30 @@ function App() {
     [integration, setIntegration] = useState<Integration | null>(null);
   const [search, setSearch] = useState(""),
     [passwordOpen, setPasswordOpen] = useState(false);
+  const [loginMessage, setLoginMessage] = useState("");
+  const authGeneration = useRef(0);
+  const clearSession = useCallback(() => {
+    authGeneration.current++;
+    setUser(null);
+    setConnections([]);
+    setIntegration(null);
+    setSelected(null);
+    setCreate(false);
+    setPasswordOpen(false);
+    setTab("connections");
+  }, []);
   const refresh = useCallback(async () => {
+    const generation = authGeneration.current;
     const [result, platform] = await Promise.all([
       api<{ connections: Connection[] }>("/connections"),
       api<Integration>("/platform"),
     ]);
+    if (generation !== authGeneration.current) return;
     setConnections(result.connections);
     setIntegration(platform);
   }, []);
   useEffect(() => {
-    const expired = () => {
-      setUser(null);
-      setIntegration(null);
-      setSelected(null);
-      setTab("connections");
-    };
+    const expired = clearSession;
     window.addEventListener("session-expired", expired);
     api<{ user: User; setup: Setup }>("/me")
       .then((r) => {
@@ -418,7 +432,7 @@ function App() {
       })
       .catch(() => setUser(null));
     return () => window.removeEventListener("session-expired", expired);
-  }, []);
+  }, [clearSession]);
   useEffect(() => {
     if (!user) return;
     void refresh().catch((e) => setNotice({ error: true, text: e.message }));
@@ -430,15 +444,15 @@ function App() {
     }, 10_000);
     return () => clearInterval(timer);
   }, [user, refresh]);
-  async function run(key: string, fn: () => Promise<void>, message?: string) {
+  async function run(key: string, fn: () => Promise<void>, message?: string, refreshAfter = true) {
     setBusy(key);
     setNotice(null);
     try {
       await fn();
-      await refresh();
+      if (refreshAfter) await refresh();
       if (message) setNotice({ error: false, text: message });
     } catch (e) {
-      await refresh().catch(() => {});
+      if (refreshAfter) await refresh().catch(() => {});
       setNotice({ error: true, text: (e as Error).message });
     } finally {
       setBusy("");
@@ -450,7 +464,20 @@ function App() {
         <Spinner /> Abrindo portal…
       </div>
     );
-  if (!user) return <Login done={setUser} />;
+  if (!user)
+    return (
+      <Login
+        message={loginMessage}
+        done={(next) => {
+          authGeneration.current++;
+          setConnections([]);
+          setNotice(null);
+          setSearch("");
+          setLoginMessage("");
+          setUser(next);
+        }}
+      />
+    );
   const current = connections.find((c) => c.id === selected);
   const active = connections.filter((c) => c.overflow || c.individual > 0).length;
   const title = tab === "activity" ? "Atividade" : tab === "team" ? "Equipe" : "Dispositivos";
@@ -509,13 +536,15 @@ function App() {
               className="icon-button"
               aria-label="Sair"
               onClick={() =>
-                void run("logout", async () => {
-                  await api("/logout", {});
-                  setUser(null);
-                  setIntegration(null);
-                  setSelected(null);
-                  setTab("connections");
-                })
+                void run(
+                  "logout",
+                  async () => {
+                    await api("/logout", {});
+                    clearSession();
+                  },
+                  undefined,
+                  false,
+                )
               }
             >
               <LogOut size={17} />
@@ -546,7 +575,7 @@ function App() {
                       : "Pessoas com acesso aos números e ao transbordo."}
                 </p>
               </div>
-              {tab === "connections" && user.role === "admin" && (
+              {tab === "connections" && (
                 <button className="primary" onClick={() => setCreate(true)}>
                   <Plus size={17} /> Adicionar dispositivo
                 </button>
@@ -651,11 +680,9 @@ function App() {
                     title="Seu primeiro dispositivo começa aqui"
                     text="Conecte um WhatsApp à plataforma e ative o transbordo quando estiver pronto."
                   >
-                    {user.role === "admin" && (
-                      <button className="primary" onClick={() => setCreate(true)}>
-                        <Plus size={17} /> Adicionar dispositivo
-                      </button>
-                    )}
+                    <button className="primary" onClick={() => setCreate(true)}>
+                      <Plus size={17} /> Adicionar dispositivo
+                    </button>
                   </Empty>
                 ) : (
                   <div className="connection-grid">
@@ -793,14 +820,23 @@ function App() {
               onSubmit={(e) => {
                 e.preventDefault();
                 const f = new FormData(e.currentTarget);
-                void run("password", async () => {
-                  await api("/password", {
-                    current: f.get("current"),
-                    password: f.get("password"),
-                  });
-                  setPasswordOpen(false);
-                  setUser(null);
-                });
+                if (f.get("password") !== f.get("confirmation")) {
+                  setNotice({ error: true, text: "A confirmação não corresponde à nova senha." });
+                  return;
+                }
+                void run(
+                  "password",
+                  async () => {
+                    await api("/password", {
+                      current: f.get("current"),
+                      password: f.get("password"),
+                    });
+                    clearSession();
+                    setLoginMessage("Senha alterada com sucesso. Entre com a nova senha.");
+                  },
+                  undefined,
+                  false,
+                );
               }}
             >
               <label>
@@ -813,6 +849,18 @@ function App() {
                   type="password"
                   name="password"
                   minLength={12}
+                  maxLength={256}
+                  required
+                  autoComplete="new-password"
+                />
+              </label>
+              <label>
+                Confirmar nova senha
+                <input
+                  type="password"
+                  name="confirmation"
+                  minLength={12}
+                  maxLength={256}
                   required
                   autoComplete="new-password"
                 />
@@ -1024,7 +1072,7 @@ function ConnectionDetail({
   useEffect(() => {
     setQr(null);
     setRemoveOpen(false);
-    setTab(c.webhook_configured || user.role !== "admin" ? "contacts" : "setup");
+    setTab(c.webhook_configured ? "contacts" : "setup");
   }, [c.id]);
   useEffect(() => {
     if (!qr) return;
@@ -1071,14 +1119,12 @@ function ConnectionDetail({
         <button className={tab === "contacts" ? "active" : ""} onClick={() => setTab("contacts")}>
           <Users size={16} /> Contatos e exceções
         </button>
-        {user.role === "admin" && (
-          <button className={tab === "setup" ? "active" : ""} onClick={() => setTab("setup")}>
-            <Smartphone size={16} /> Dispositivo e perfil
-          </button>
-        )}
+        <button className={tab === "setup" ? "active" : ""} onClick={() => setTab("setup")}>
+          <Smartphone size={16} /> Dispositivo e perfil
+        </button>
       </div>
       {tab === "contacts" && <Contacts connection={c} busy={busy} run={run} />}
-      {tab === "setup" && user.role === "admin" && (
+      {tab === "setup" && (
         <div className="setup-grid">
           <section className="panel">
             <h2>
@@ -1166,18 +1212,20 @@ function ConnectionDetail({
               <p>Este dispositivo usa a conexão única da plataforma com o Signal.</p>
             </div>
           </section>
-          <section className="panel remove-device">
-            <h2>
-              <Trash2 size={18} /> Remover dispositivo
-            </h2>
-            <p>
-              Retire este dispositivo e seus contatos do portal. A conexão da plataforma e os demais
-              dispositivos continuam funcionando.
-            </p>
-            <button className="danger" disabled={!!busy} onClick={() => setRemoveOpen(true)}>
-              <Trash2 size={16} /> Remover dispositivo
-            </button>
-          </section>
+          {user.role === "admin" && (
+            <section className="panel remove-device">
+              <h2>
+                <Trash2 size={18} /> Remover dispositivo
+              </h2>
+              <p>
+                Retire este dispositivo e seus contatos do portal. A conexão da plataforma e os
+                demais dispositivos continuam funcionando.
+              </p>
+              <button className="danger" disabled={!!busy} onClick={() => setRemoveOpen(true)}>
+                <Trash2 size={16} /> Remover dispositivo
+              </button>
+            </section>
+          )}
         </div>
       )}
       {removeOpen && user.role === "admin" && (
@@ -1645,8 +1693,8 @@ function Team({ busy, run, user }: { busy: string; run: Run; user: User }) {
         <div>
           <h2>Acessos da equipe</h2>
           <p>
-            Operadores controlam transbordo e contatos. Administradores também configuram conexões e
-            acessos.
+            Operadores adicionam e gerenciam seus próprios dispositivos. Administradores veem todos
+            e configuram a integração e os acessos.
           </p>
         </div>
         <button className="primary" onClick={() => setAdd(true)}>
