@@ -22,68 +22,418 @@ const config: Config = configSchema.parse({
 });
 const signalUrl = `https://signal.example.test/webhooks/evolution/abcdefghijklmnop/${"s".repeat(43)}`;
 
-test("v1 migration preserves users, device keys, contact exclusions and queued data; platform identity survives restarts", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "portal-migration-"));
-  const path = join(dir, "portal.db");
-  try {
-    let store = new Store(path, config.ENCRYPTION_KEY);
-    const { connection: device } = store.createConnection({
-      name: "Existing device",
-      instance: "existing",
-      evolutionKey: "existing-instance-key",
-    });
-    const hash = await hashPassword(password);
-    store.db
-      .prepare("INSERT INTO users VALUES(?,?,?,?,?,1)")
-      .run("operator", "Operator", "operator@example.test", hash, "operator");
-    store.setSecrets(device, { ...store.secrets(device), signalUrl });
-    store.upsertContact(device.id, "5583999991111@s.whatsapp.net", "Contato", "5583999991111");
-    store.setIgnored(device.id, "5583999991111@s.whatsapp.net", true, "operator");
-    store.enqueue(
-      device,
-      "old-paused",
-      "MESSAGES_UPSERT",
-      "5583999991111@s.whatsapp.net",
-      {},
-      "OVERFLOW_DISABLED",
-    );
-    store.close();
-    const legacy = new DatabaseSync(path);
-    for (const name of [
-      "profile_name",
-      "profile_picture_url",
-      "profile_photo",
-      "profile_photo_type",
-      "profile_synced_at",
-    ])
-      legacy.exec(`ALTER TABLE connections DROP COLUMN ${name}`);
-    legacy.exec("DROP TABLE platform; PRAGMA user_version=1");
-    legacy.close();
-    store = new Store(path, config.ENCRYPTION_KEY);
-    assert.equal(store.db.prepare("PRAGMA user_version").get()?.user_version, 2);
-    assert.equal(
-      store.db.prepare("SELECT password FROM users WHERE id='operator'").get()?.password,
-      hash,
-    );
-    assert.equal(store.secrets(store.connection(device.id)).evolutionKey, "existing-instance-key");
-    assert.equal(store.signalUrl(store.connection(device.id)), signalUrl);
-    assert.equal(store.isIgnored(device.id, "5583999991111@s.whatsapp.net"), true);
-    assert.equal(
-      store.db.prepare("SELECT status FROM deliveries WHERE dedupe='old-paused'").get()?.status,
-      "ignored",
-    );
-    const platform = store.platform();
-    assert.ok(
-      !JSON.stringify(store.db.prepare("SELECT * FROM platform").get()).includes(platform.apiKey),
-    );
-    store.close();
-    store = new Store(path, config.ENCRYPTION_KEY);
-    assert.deepEqual(store.platform(), platform);
-    store.close();
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+const selectedPeer = "558399991111@s.whatsapp.net";
+const otherPeer = "558399992222@s.whatsapp.net";
+
+test("individual activation forwards only chosen contacts and their Signal replies while the general switch stays off", async (t) => {
+  const f = await fixture(t);
+  f.store.setPlatformWebhook(signalUrl, "admin");
+  while (await f.dispatcher.tick()) {
+    /* drain device metadata */
   }
+  f.calls.length = 0;
+  syncContacts(
+    f.store,
+    f.id,
+    [selectedPeer, otherPeer].map((remoteJid) => ({ remoteJid })),
+  );
+  const list = await f.app.inject({ url: `/api/connections/${f.id}/contacts`, headers: f.headers });
+  assert.ok(list.json().contacts.every((contact: { overflow: number }) => contact.overflow === 0));
+  const activate = await f.app.inject({
+    method: "PATCH",
+    url: `/api/connections/${f.id}/contacts`,
+    headers: f.headers,
+    payload: { jid: selectedPeer, overflow: true },
+  });
+  assert.equal(activate.statusCode, 200, activate.body);
+  assert.equal(f.store.connection(f.id).overflow, 0);
+  for (const [index, peer] of [selectedPeer, otherPeer].entries()) {
+    const result = await f.app.inject({
+      method: "POST",
+      url: f.hook,
+      payload: f.inbound(`selected-${index}`, peer),
+    });
+    assert.equal(result.json().events[0].ignored, peer !== selectedPeer);
+  }
+  while (await f.dispatcher.tick()) {
+    /* dispatch only selected contact */
+  }
+  assert.equal(f.calls.length, 1);
+  const sent = JSON.parse(String(f.calls[0]!.init.body));
+  assert.equal(sent.instance, f.store.platform().id);
+  assert.equal(sent.device.id, f.id);
+  assert.equal(sent.data.key.remoteJid, selectedPeer);
+  const reply = (peer: string) =>
+    f.app.inject({
+      method: "POST",
+      url: `/platform/message/sendText/${f.id}`,
+      headers: { apikey: f.store.platform().apiKey },
+      payload: { number: peer, text: "Resposta" },
+    });
+  assert.equal((await reply(selectedPeer)).statusCode, 200);
+  assert.equal((await reply(otherPeer)).json().error, "OVERFLOW_DISABLED");
+  assert.equal(f.calls[1]!.url, "https://evolution.example.test/message/sendText/number-one");
+  f.store.setOverflow(f.id, true, "admin");
+  assert.equal((await reply(otherPeer)).statusCode, 200);
+  assert.equal(f.store.contactPolicy(f.store.connection(f.id), otherPeer).individual, false);
+  f.store.setIgnored(f.id, selectedPeer, true, "admin");
+  assert.equal((await reply(selectedPeer)).json().error, "CONTACT_IGNORED");
+  const ignored = await f.app.inject({
+    method: "POST",
+    url: f.hook,
+    payload: f.inbound("ignored-selection"),
+  });
+  assert.equal(ignored.json().events[0].ignored, true);
+  f.store.setOverflow(f.id, false, "admin");
+  f.store.setIgnored(f.id, selectedPeer, false, "admin");
+  assert.equal((await reply(selectedPeer)).statusCode, 200);
+  assert.equal((await reply(otherPeer)).statusCode, 409);
+  f.store.setContactPolicy(f.id, selectedPeer, { overflow: false }, "admin");
+  assert.equal((await reply(selectedPeer)).statusCode, 409);
 });
+
+test("general pause keeps selected contacts queued; disabling an individual selection cancels only when the general switch is off", async (t) => {
+  const f = await fixture(t);
+  f.store.setOverflow(f.id, true, "admin");
+  for (const peer of [selectedPeer, otherPeer])
+    await f.app.inject({ method: "POST", url: f.hook, payload: f.inbound(peer, peer) });
+  f.store.setContactPolicy(f.id, selectedPeer, { overflow: true }, "admin");
+  f.store.setContactPolicy(f.id, selectedPeer, { overflow: false }, "admin");
+  assert.equal(
+    f.store.db.prepare("SELECT count(*) AS n FROM deliveries WHERE status='pending'").get()?.n,
+    2,
+  );
+  f.store.setContactPolicy(f.id, selectedPeer, { overflow: true }, "admin");
+  f.store.setOverflow(f.id, false, "admin");
+  assert.equal(
+    f.store.db.prepare("SELECT status FROM deliveries WHERE peer=?").get(selectedPeer)?.status,
+    "pending",
+  );
+  assert.equal(
+    f.store.db.prepare("SELECT status FROM deliveries WHERE peer=?").get(otherPeer)?.status,
+    "ignored",
+  );
+  f.store.setContactPolicy(f.id, selectedPeer, { overflow: false }, "admin");
+  f.store.setContactPolicy(f.id, selectedPeer, { overflow: true }, "admin");
+  f.store.setOverflow(f.id, true, "admin");
+  assert.equal(await f.dispatcher.tick(), false);
+  assert.equal(f.calls.length, 0);
+});
+
+test("individual activation and unignoring never replay old messages; changing general mode preserves continuous activation", async (t) => {
+  const f = await fixture(t);
+  const initial = Math.floor(Date.now() / 1000) * 1000;
+  let now = initial;
+  t.mock.method(Date, "now", () => now);
+  const incoming = async (id: string, timestamp = now) => {
+    const payload = f.inbound(id);
+    payload.data.messageTimestamp = timestamp / 1000;
+    return (await f.app.inject({ method: "POST", url: f.hook, payload })).json().events[0];
+  };
+  assert.equal((await incoming("received-while-off")).ignored, true);
+  now += 10_000;
+  f.store.setContactPolicy(f.id, selectedPeer, { overflow: true }, "admin");
+  assert.equal((await incoming("received-while-off")).duplicate, true);
+  assert.equal((await incoming("late-history", initial)).ignored, true);
+  assert.equal((await incoming("new-message")).ignored, false);
+  now += 10_000;
+  f.store.setOverflow(f.id, true, "admin");
+  now += 10_000;
+  f.store.setOverflow(f.id, false, "admin");
+  assert.equal(
+    f.store.contactPolicy(f.store.connection(f.id), selectedPeer).since,
+    initial + 10_000,
+  );
+  assert.equal((await incoming("continuous", initial + 15_000)).ignored, false);
+  f.store.setIgnored(f.id, selectedPeer, true, "admin");
+  now += 10_000;
+  f.store.setIgnored(f.id, selectedPeer, false, "admin");
+  assert.equal((await incoming("before-unignore", initial + 25_000)).ignored, true);
+  assert.equal((await incoming("after-unignore")).ignored, false);
+  assert.equal(f.store.contactPolicy(f.store.connection(f.id), selectedPeer).since, now);
+  const old = f.store.db.prepare("SELECT last_error FROM deliveries WHERE status='ignored'").all();
+  assert.ok(old.some((row) => row.last_error === "BEFORE_ACTIVATION"));
+});
+
+test("sync and LID aliases preserve individual selection and ignore precedence only for their device", async (t) => {
+  const f = await fixture(t);
+  const lid = "123456789@lid";
+  f.store.upsertContact(f.id, lid, "Cliente", null);
+  f.store.setContactPolicy(f.id, lid, { overflow: true }, "admin");
+  syncContacts(f.store, f.id, [
+    { remoteJid: selectedPeer, lid, pushName: "Nome atualizado" },
+    { remoteJid: otherPeer },
+  ]);
+  const c = f.store.connection(f.id);
+  assert.equal(f.store.contactPolicy(c, selectedPeer).enabled, true);
+  assert.equal(f.store.contactPolicy(c, otherPeer).enabled, false);
+  f.store.setIgnored(f.id, selectedPeer, true, "admin");
+  assert.equal(f.store.contactPolicy(c, lid).reason, "CONTACT_IGNORED");
+  syncContacts(f.store, f.id, [{ remoteJid: lid, phoneNumber: selectedPeer, name: "Atualizado" }]);
+  assert.equal(f.store.contactPolicy(c, selectedPeer).individual, true);
+  assert.equal(f.store.contactPolicy(c, selectedPeer).ignored, true);
+  f.store.setIgnored(f.id, lid, false, "admin");
+  const inbound = f.inbound("selected-lid", lid);
+  assert.equal(
+    (await f.app.inject({ method: "POST", url: f.hook, payload: inbound })).json().events[0]
+      .ignored,
+    false,
+  );
+  f.store.setContactPolicy(f.id, lid, { overflow: false }, "admin");
+  assert.equal(f.store.contactPolicy(c, selectedPeer).enabled, false);
+  const second = f.store.createConnection({ name: "Outro dispositivo" }).connection;
+  assert.equal(f.store.contactPolicy(second, selectedPeer).individual, false);
+  assert.equal(f.store.contactPolicy(second, lid).enabled, false);
+});
+
+test("Signal batches validate every recipient; selective mode supports media and presence", async (t) => {
+  const f = await fixture(t);
+  f.store.upsertContact(f.id, selectedPeer, "Cliente", "558399991111");
+  f.store.setContactPolicy(f.id, selectedPeer, { overflow: true }, "admin");
+  const request = (operation: string, payload: Record<string, unknown>) =>
+    f.app.inject({
+      method: "POST",
+      url: `/bridge/${f.id}/${operation}/number-one`,
+      headers: { apikey: f.bridgeKey },
+      payload,
+    });
+  assert.equal(
+    (await request("chat/whatsappNumbers", { numbers: [selectedPeer, otherPeer] })).statusCode,
+    409,
+  );
+  assert.equal(
+    (
+      await request("chat/markMessageAsRead", {
+        readMessages: [{ remoteJid: selectedPeer }, { remoteJid: otherPeer }],
+      })
+    ).statusCode,
+    409,
+  );
+  assert.equal(
+    (await request("chat/whatsappNumbers", { numbers: [selectedPeer, ""] })).statusCode,
+    400,
+  );
+  assert.equal((await request("chat/sendPresence", { number: otherPeer })).statusCode, 409);
+  assert.equal(f.calls.length, 0);
+  for (const [operation, payload] of [
+    ["chat/whatsappNumbers", { numbers: [selectedPeer] }],
+    ["chat/markMessageAsRead", { readMessages: [{ remoteJid: selectedPeer }] }],
+    ["chat/sendPresence", { number: selectedPeer }],
+    [
+      "message/sendMedia",
+      { number: selectedPeer, mediatype: "image", media: "data:image/png;base64,AA==" },
+    ],
+    ["message/sendReaction", { key: { remoteJid: selectedPeer, id: "msg" }, reaction: "👍" }],
+    ["chat/getBase64FromMediaMessage", { message: { key: { id: "msg" } } }],
+    ["instance/setPresence", { presence: "available" }],
+  ] as const) {
+    const result = await request(operation, payload);
+    assert.equal(result.statusCode, 200, `${operation}: ${result.body}`);
+  }
+  f.store.setIgnored(f.id, selectedPeer, true, "admin");
+  assert.equal(
+    (await request("message/sendMedia", { number: selectedPeer })).json().error,
+    "CONTACT_IGNORED",
+  );
+  assert.equal(
+    (await request("chat/getBase64FromMediaMessage", { message: { key: { id: "msg" } } }))
+      .statusCode,
+    409,
+  );
+});
+
+test("individual selection validates configuration, authorizes operators and prevents webhook changes while effective", async (t) => {
+  const f = await fixture(t);
+  f.store.upsertContact(f.id, selectedPeer, "Cliente", "558399991111");
+  const login = await f.app.inject({
+    method: "POST",
+    url: "/api/login",
+    headers: { origin: config.PUBLIC_URL },
+    payload: { email: "operator@example.test", password },
+  });
+  const cookie = login.cookies[0]!;
+  const headers = { origin: config.PUBLIC_URL, cookie: `${cookie.name}=${cookie.value}` };
+  const url = `/api/connections/${f.id}/contacts`;
+  assert.equal(
+    (await f.app.inject({ method: "PATCH", url, headers, payload: { jid: selectedPeer } }))
+      .statusCode,
+    400,
+  );
+  assert.equal(
+    (
+      await f.app.inject({
+        method: "PATCH",
+        url,
+        headers,
+        payload: { jid: otherPeer, overflow: true },
+      })
+    ).statusCode,
+    404,
+  );
+  f.store.db.prepare("UPDATE connections SET webhook_configured=0 WHERE id=?").run(f.id);
+  assert.equal(
+    (
+      await f.app.inject({
+        method: "PATCH",
+        url,
+        headers,
+        payload: { jid: selectedPeer, overflow: true },
+      })
+    ).json().error,
+    "CONNECTION_SETUP_REQUIRED",
+  );
+  f.store.db.prepare("UPDATE connections SET webhook_configured=1 WHERE id=?").run(f.id);
+  assert.equal(
+    (
+      await f.app.inject({
+        method: "PATCH",
+        url,
+        headers,
+        payload: { jid: selectedPeer, overflow: true },
+      })
+    ).statusCode,
+    200,
+  );
+  assert.throws(
+    () => f.store.setPlatformWebhook(signalUrl, "admin"),
+    /PAUSE_BEFORE_CHANGING_WEBHOOK/,
+  );
+  assert.equal(
+    (
+      await f.app.inject({
+        method: "PATCH",
+        url: `/api/connections/${f.id}`,
+        headers: f.headers,
+        payload: { signalUrl },
+      })
+    ).statusCode,
+    409,
+  );
+  const filtered = await f.app.inject({ url: `${url}?overflow=true`, headers });
+  assert.equal(filtered.json().total, 1);
+  f.store.setIgnored(f.id, selectedPeer, true, "admin");
+  assert.equal(f.store.hasActiveOverflow(), false);
+  f.store.setPlatformWebhook(signalUrl, "admin");
+});
+
+test("stopping individual overflow during an in-flight delivery never resurrects its failed attempt", async (t) => {
+  for (const status of [200, 503])
+    await t.test(`HTTP ${status}`, async (t) => {
+      let release!: (response: Response) => void;
+      const f = await fixture(
+        t,
+        async () =>
+          new Promise<Response>((resolve) => {
+            release = resolve;
+          }),
+      );
+      f.store.upsertContact(f.id, selectedPeer, "Cliente", "558399991111");
+      f.store.setContactPolicy(f.id, selectedPeer, { overflow: true }, "admin");
+      await f.app.inject({
+        method: "POST",
+        url: f.hook,
+        payload: f.inbound("individual-in-flight"),
+      });
+      const pending = f.dispatcher.tick();
+      f.store.setContactPolicy(f.id, selectedPeer, { overflow: false }, "admin");
+      f.store.setContactPolicy(f.id, selectedPeer, { overflow: true }, "admin");
+      release(Response.json({}, { status }));
+      await pending;
+      assert.equal(
+        f.store.db.prepare("SELECT status FROM deliveries").get()?.status,
+        status === 200 ? "delivered" : "ignored",
+      );
+      f.store.db.prepare("UPDATE deliveries SET next_at=0").run();
+      await f.dispatcher.tick();
+      assert.equal(f.calls.length, 1);
+    });
+});
+
+for (const version of [1, 2])
+  test(`v${version} migration defaults individual overflow off and preserves existing configuration`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "portal-migration-"));
+    const path = join(dir, "portal.db");
+    try {
+      let store = new Store(path, config.ENCRYPTION_KEY);
+      const { connection: device } = store.createConnection({
+        name: "Existing device",
+        instance: "existing",
+        evolutionKey: "existing-instance-key",
+      });
+      const hash = await hashPassword(password);
+      store.db
+        .prepare("INSERT INTO users VALUES(?,?,?,?,?,1)")
+        .run("operator", "Operator", "operator@example.test", hash, "operator");
+      store.setSecrets(device, { ...store.secrets(device), signalUrl });
+      store.upsertContact(device.id, "5583999991111@s.whatsapp.net", "Contato", "5583999991111");
+      store.setIgnored(device.id, "5583999991111@s.whatsapp.net", true, "operator");
+      store.upsertContact(device.id, "5583999992222@s.whatsapp.net", "Outro", "5583999992222");
+      store.db.prepare("UPDATE connections SET webhook_configured=1 WHERE id=?").run(device.id);
+      store.setOverflow(device.id, true, "operator");
+      const enabledAt = store.connection(device.id).enabled_at;
+      const originalPlatform = store.platform();
+      store.enqueue(
+        device,
+        "old-paused",
+        "MESSAGES_UPSERT",
+        "5583999991111@s.whatsapp.net",
+        {},
+        "OVERFLOW_DISABLED",
+      );
+      store.close();
+      const legacy = new DatabaseSync(path);
+      if (version === 1)
+        for (const name of [
+          "profile_name",
+          "profile_picture_url",
+          "profile_photo",
+          "profile_photo_type",
+          "profile_synced_at",
+        ])
+          legacy.exec(`ALTER TABLE connections DROP COLUMN ${name}`);
+      if (version === 1) legacy.exec("DROP TABLE platform");
+      legacy.exec(
+        `ALTER TABLE contacts DROP COLUMN overflow; ALTER TABLE contacts DROP COLUMN enabled_at; PRAGMA user_version=${version}`,
+      );
+      legacy.close();
+      store = new Store(path, config.ENCRYPTION_KEY);
+      assert.equal(store.db.prepare("PRAGMA user_version").get()?.user_version, 3);
+      assert.equal(
+        store.db.prepare("SELECT count(*) AS n FROM contacts WHERE overflow<>0").get()?.n,
+        0,
+      );
+      assert.equal(
+        store.contactPolicy(store.connection(device.id), "5583999992222@s.whatsapp.net").since,
+        enabledAt,
+      );
+      assert.equal(store.connection(device.id).overflow, 1);
+      if (version === 2) assert.deepEqual(store.platform(), originalPlatform);
+      assert.equal(
+        store.db.prepare("SELECT password FROM users WHERE id='operator'").get()?.password,
+        hash,
+      );
+      assert.equal(
+        store.secrets(store.connection(device.id)).evolutionKey,
+        "existing-instance-key",
+      );
+      assert.equal(store.signalUrl(store.connection(device.id)), signalUrl);
+      assert.equal(store.isIgnored(device.id, "5583999991111@s.whatsapp.net"), true);
+      assert.equal(
+        store.db.prepare("SELECT status FROM deliveries WHERE dedupe='old-paused'").get()?.status,
+        "ignored",
+      );
+      const platform = store.platform();
+      assert.ok(
+        !JSON.stringify(store.db.prepare("SELECT * FROM platform").get()).includes(platform.apiKey),
+      );
+      store.close();
+      store = new Store(path, config.ENCRYPTION_KEY);
+      assert.deepEqual(store.platform(), platform);
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 async function fixture(t: TestContext, custom?: Transport) {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const fetcher: Transport = async (url, init) => {
@@ -300,6 +650,7 @@ test("failed removal keeps a paused device for retry; a missing remote instance 
   f.store.db.prepare("UPDATE connections SET managed=1 WHERE id=?").run(f.id);
   f.store.setOverflow(f.id, true, "admin");
   await f.app.inject({ method: "POST", url: f.hook, payload: f.inbound("cancel-on-removal") });
+  f.store.setContactPolicy(f.id, "558399991111@s.whatsapp.net", { overflow: true }, "admin");
   const result = await f.app.inject({
     method: "DELETE",
     url: `/api/connections/${f.id}`,
@@ -308,6 +659,7 @@ test("failed removal keeps a paused device for retry; a missing remote instance 
   assert.equal(result.statusCode, 502);
   assert.equal(result.json().error, "EVOLUTION_REMOVE_FAILED");
   assert.equal(f.store.connection(f.id).overflow, 0);
+  assert.equal(f.store.hasActiveOverflow(f.id), false);
   assert.equal(
     f.store.db.prepare("SELECT count(*) AS n FROM contacts WHERE connection_id=?").get(f.id)?.n,
     1,
@@ -623,7 +975,7 @@ test("Signal replies use the instance key and obey pause/exclusions; remote admi
   f.store.setIgnored(f.id, "558399991111@s.whatsapp.net", true, "admin");
   assert.equal((await f.app.inject(request)).statusCode, 409);
   f.store.setOverflow(f.id, false, "admin");
-  assert.equal((await f.app.inject(request)).json().error, "OVERFLOW_DISABLED");
+  assert.equal((await f.app.inject(request)).json().error, "CONTACT_IGNORED");
   assert.equal(
     (
       await f.app.inject({

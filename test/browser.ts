@@ -152,11 +152,53 @@ try {
     .getByRole("button", { name: "Gerenciar dispositivo" })
     .click();
   await expect(page.getByRole("heading", { name: "Quem pode chegar ao Signal?" })).toBeVisible();
+  const individual = page.getByRole("switch", {
+    name: "Ativar transbordo de Ana · teste",
+    exact: true,
+  });
+  const general = page.getByRole("switch", { name: "Ativar transbordo geral", exact: true });
+  const ana = page.locator("tbody tr").filter({ hasText: "Ana · teste" });
+  const bruno = page.locator("tbody tr").filter({ hasText: "Bruno · teste" });
+  await expect(page.getByRole("switch", { name: /^Ativar transbordo de / })).toHaveCount(4);
+  for (const control of await page.getByRole("switch", { name: /^Ativar transbordo de / }).all())
+    await expect(control).toHaveAttribute("aria-checked", "false");
+  await expect(ana.getByText("Desativado", { exact: true })).toBeVisible();
+  await individual.click();
+  await expect(individual).toHaveAttribute("aria-checked", "true");
+  await expect(general).toHaveAttribute("aria-checked", "false");
+  await expect(ana.getByText("Ativo · individual", { exact: true })).toBeVisible();
+  await expect(bruno.getByText("Desativado", { exact: true })).toBeVisible();
+  await general.click();
+  await expect(bruno.getByText("Ativo · geral", { exact: true })).toBeVisible();
+  await expect(
+    bruno.getByRole("switch", { name: "Ativar transbordo de Bruno · teste", exact: true }),
+  ).toHaveAttribute("aria-checked", "false");
+  await general.click();
+  await expect(bruno.getByText("Desativado", { exact: true })).toBeVisible();
+  await expect(ana.getByText("Ativo · individual", { exact: true })).toBeVisible();
+  await page.getByLabel("Filtrar contatos").selectOption("individual");
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await page.getByLabel("Filtrar contatos").selectOption("all");
+  await expect(page.locator("tbody tr")).toHaveCount(4);
+  await screenshot("individual-contacts-desktop.png");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await individual.scrollIntoViewIfNeeded();
+  await individual.click();
+  await expect(ana.getByText("Desativado", { exact: true })).toBeVisible();
+  await individual.click();
+  await expect(ana.getByText("Ativo · individual", { exact: true })).toBeVisible();
+  await screenshot("individual-contacts-mobile.png", false);
+  if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth))
+    throw new Error("Individual contact controls overflow the mobile viewport");
+  await expect(individual).toBeVisible();
+  await page.setViewportSize({ width: 1440, height: 1000 });
   await page.getByRole("switch", { name: "Ignorar Ana · teste" }).click();
   await expect(page.getByRole("switch", { name: "Ignorar Ana · teste" })).toHaveAttribute(
     "aria-checked",
     "true",
   );
+  await expect(ana.getByText("Ignorado", { exact: true })).toBeVisible();
+  await expect(individual).toHaveAttribute("aria-checked", "true");
   await page.getByLabel("Buscar contato").fill("Ana");
   await expect(page.locator("tbody tr")).toHaveCount(1);
   await page.getByLabel("Buscar contato").fill("");
@@ -197,9 +239,9 @@ try {
     )
     .toBeGreaterThan(0);
   await screenshot("device-profile.png");
-  await page.getByRole("switch", { name: "Ativar transbordo", exact: true }).click();
+  await page.getByRole("switch", { name: "Ativar transbordo geral", exact: true }).click();
   await expect(
-    page.getByRole("switch", { name: "Ativar transbordo", exact: true }),
+    page.getByRole("switch", { name: "Ativar transbordo geral", exact: true }),
   ).toHaveAttribute("aria-checked", "true");
   await dispatcher.tick();
   const added = store.db
@@ -274,7 +316,7 @@ try {
   await page.getByRole("button", { name: "Sair", exact: true }).click();
   if (failures.length) throw new Error(failures.join("\n"));
   console.log(
-    "Browser checks passed: login, shared platform setup, device isolation, pause, contacts, profile/photo sync, new device, removal/cancel, operator restrictions, mobile layout, team and logout.",
+    "Browser checks passed: login, shared platform setup, device isolation, individual/general contact overflow, ignore precedence, contact filters, profile/photo sync, new device, removal/cancel, operator restrictions, mobile layout, team and logout.",
   );
   console.log(`Simulated upstream calls: ${upstream.length}. No real messages sent.`);
 } finally {

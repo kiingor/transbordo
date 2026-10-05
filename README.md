@@ -8,7 +8,7 @@ O repositório e o banco são próprios. Não há acesso direto ao banco do Sign
 - Login por pessoa, perfis administrador e operador e revogação de sessões.
 - Novas instâncias Evolution por QR Code ou vinculação de uma instância existente com sua chave.
 - Uma conexão da plataforma com um único canal no Signal; vários dispositivos sob essa conexão.
-- Transbordo individual por dispositivo, inicialmente pausado.
+- Transbordo geral por dispositivo e ativação individual por contato, ambos desligados por padrão.
 - Nome de usuário, foto e número sincronizados da Evolution; fotos servidas somente a usuários autenticados.
 - Sincronização de contatos, busca, paginação e exclusões individuais, preservadas nas sincronizações.
 - Recebimento autenticado, fila persistente, deduplicação e tentativas de entrega ao Signal.
@@ -57,7 +57,7 @@ Uma Evolution remota não alcança o `localhost` do Mac: o QR/webhook real exige
 2. No Signal, crie **um único canal Evolution API**, marque **Conexão externa**, escolha a unidade e use esses três campos.
 3. Copie o webhook completo gerado pelo Signal e salve em **Webhook único do Signal** no portal.
 4. Adicione dispositivos e clique em **Conectar WhatsApp**. Para uma instância existente, essa ação substitui seu webhook atual pelo portal; para uma nova, provisiona e apresenta o QR Code.
-5. Confira nome, foto e número em **Dispositivo e perfil**, sincronize contatos, configure exceções e ative o transbordo de cada aparelho.
+5. Confira nome, foto e número em **Dispositivo e perfil**, sincronize contatos e escolha quem encaminhar. Use **Ativação individual** nos contatos desejados ou ligue **Transbordo geral** para todos os não ignorados.
 
 ```text
 Vários dispositivos Evolution → Portal → Um canal no Signal
@@ -83,7 +83,7 @@ o envio de teste do Signal oferece uma seleção explícita do aparelho.
 ### Remover um dispositivo
 
 Em **Gerenciar dispositivo → Dispositivo e perfil → Remover dispositivo**, o administrador
-confirma a remoção. O transbordo é pausado, pendências são canceladas e as requisições já
+confirma a remoção. O transbordo geral e as ativações individuais são desligados, pendências são canceladas e as requisições já
 iniciadas terminam antes da exclusão. Contatos, exceções, foto e histórico local daquele
 dispositivo são excluídos; auditoria, outros dispositivos, canal da plataforma e conversas
 existentes no Signal são preservados.
@@ -97,18 +97,24 @@ pausado para permitir nova tentativa. Instância já ausente (404) não impede a
 
 ### Atualização de uma instalação anterior
 
-Faça backup consistente do SQLite e preserve a chave de cifragem. A migração para schema 2 é
-transacional e preserva usuários, dispositivos, contatos, exclusões e fila. Gera uma identidade e
-chave globais estáveis. Bridges individuais antigos continuam compatíveis até a configuração do
+Faça backup consistente do SQLite e preserve a chave de cifragem. A migração para schema 3 é
+transacional e preserva usuários, dispositivos, contatos, exclusões, fila e estado do transbordo geral.
+A ativação individual começa desligada para todos os contatos existentes. A atualização a partir
+do schema 1 também gera a identidade e chave globais estáveis do schema 2; instalações v2 preservam ambas.
+Versões antigas do portal não abrem o schema 3: um rollback exige a imagem e o backup anteriores juntos.
+Bridges individuais antigos continuam compatíveis até a configuração do
 webhook global. Para migrar, pause os dispositivos, configure o único canal da plataforma e então
-reative os aparelhos desejados. Alterar o webhook exige todos pausados e descarta pendências do
+reative os aparelhos desejados. Alterar o webhook exige o geral desligado e nenhuma ativação individual efetiva; descarta pendências do
 destino anterior, sem replay. Canais antigos do Signal não são removidos automaticamente.
 
 ## Regras de encaminhamento
 
-- Pausado: reconhece o webhook, registra apenas metadados e descarta o conteúdo. Nunca cria uma fila para reenviar quando reativado.
-- Ao pausar: cancela entregas pendentes. Uma requisição que já saiu pode terminar; o histórico registra seu resultado real. Falhas dessa requisição não voltam à fila depois da pausa.
-- Mensagens com timestamp anterior à última ativação são descartadas, inclusive histórico reenviado pela Evolution.
+- Geral desligado: encaminha apenas contatos com **Ativação individual** ligada e que não estejam ignorados. Os demais webhooks registram apenas metadados, descartando o conteúdo sem replay posterior.
+- Geral ligado: encaminha todos os contatos não ignorados, sem alterar suas escolhas de ativação individual. Desligar a ativação individual neste modo mantém o contato no geral; use **Ignorar** para bloqueá-lo.
+- Ignorar tem prioridade sobre ambos os modos. A escolha individual é preservada enquanto ignorado, mas não encaminha nada até deixar de ser ignorado.
+- Desligar o geral cancela só as pendências de contatos sem ativação individual. Desativar um contato com o geral desligado também cancela suas pendências. Uma requisição que já saiu pode terminar; falhas dessa requisição não voltam à fila depois da desativação.
+- Mensagens com timestamp anterior ao início da ativação efetiva do contato são descartadas, inclusive histórico reenviado pela Evolution. Alternar entre geral e individual sem interromper o transbordo preserva esse início; retirar um contato dos ignorados inicia uma nova janela.
+- Contatos novos e existentes começam com ativação individual desligada. Sincronizar a Evolution preserva escolhas e exclusões, inclusive ao resolver aliases LID para número de telefone.
 - Contato ignorado: bloqueia entrada e respostas. A opção vale apenas para aquele número conectado.
 - Identidades `@lid` são ligadas aos números quando a Evolution fornece o identificador alternativo. Com exclusões configuradas, uma identidade LID sem correspondência é descartada com motivo explícito para não contornar a exclusão.
 - Grupos e status/broadcasts não são encaminhados. Eventos de contatos e conexão atualizam o portal mesmo durante a pausa.

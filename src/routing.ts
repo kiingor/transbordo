@@ -115,19 +115,18 @@ export function receive(store: Store, c: Connection, input: unknown) {
         !!store.db
           .prepare("SELECT 1 FROM contacts WHERE connection_id=? AND ignored=1 LIMIT 1")
           .get(c.id);
+      const policy = store.contactPolicy(c, peer);
       const reason = !isPerson(peer)
         ? "UNSUPPORTED_CHAT"
-        : !c.overflow
-          ? "OVERFLOW_DISABLED"
-          : event === "MESSAGES_UPSERT" && c.enabled_at && occurredAt < c.enabled_at
+        : policy.reason
+          ? policy.reason
+          : event === "MESSAGES_UPSERT" && policy.since && occurredAt < policy.since
             ? "BEFORE_ACTIVATION"
-            : store.isIgnored(c.id, peer)
-              ? "CONTACT_IGNORED"
-              : unresolvedWithExclusions
-                ? "IDENTITY_UNRESOLVED"
-                : !store.signalUrl(c)
-                  ? "SIGNAL_NOT_CONFIGURED"
-                  : undefined;
+            : unresolvedWithExclusions
+              ? "IDENTITY_UNRESOLVED"
+              : !store.signalUrl(c)
+                ? "SIGNAL_NOT_CONFIGURED"
+                : undefined;
       return store.enqueue(c, dedupe, event, peer, clean, reason);
     });
     return { accepted: true, events: results };
@@ -151,15 +150,19 @@ export class Dispatcher {
       if (!job) return false;
       const c = this.store.connection(job.connection_id);
       this.activeDevice = c.id;
+      const policy = this.store.contactPolicy(c, job.peer);
       if (
         !job.payload ||
         job.last_error === "DESTINATION_CHANGED" ||
         (job.event !== "DEVICE_UPDATE" &&
-          (!c.overflow ||
-            this.store.isIgnored(c.id, job.peer) ||
+          (!policy.enabled ||
             ["OVERFLOW_DISABLED", "CONTACT_IGNORED"].includes(job.last_error ?? "")))
       ) {
-        this.store.finish(job.id, "ignored", !c.overflow ? "OVERFLOW_DISABLED" : "CONTACT_IGNORED");
+        this.store.finish(
+          job.id,
+          "ignored",
+          job.last_error ?? policy.reason ?? "OVERFLOW_DISABLED",
+        );
         return true;
       }
       if (Date.now() - job.created_at > 24 * 3600_000) {
@@ -248,7 +251,6 @@ export async function bridge(
   if (!bridgeRoutes.has(route)) throw new AppError(403, "BRIDGE_OPERATION_NOT_ALLOWED");
   const data = object(body);
   if (method !== "GET") {
-    if (!c.overflow) throw new AppError(409, "OVERFLOW_DISABLED");
     const values =
       action === "whatsappNumbers"
         ? data.numbers
@@ -257,14 +259,21 @@ export async function bridge(
             ? data.readMessages.map((v) => object(v).remoteJid)
             : []
           : [data.number ?? object(data.key).remoteJid];
-    const peers = (Array.isArray(values) ? values : [])
-      .map((v) => normalizeJid(string(v)))
-      .filter(Boolean);
+    const peers = (Array.isArray(values) ? values : []).map((v) => normalizeJid(string(v)));
     if ((category === "message" || action === "sendPresence") && peers.length !== 1)
       throw new AppError(400, "INVALID_RECIPIENT");
-    if (peers.some((peer) => !isPerson(peer))) throw new AppError(400, "INVALID_RECIPIENT");
-    if (peers.some((peer) => evolution.store.isIgnored(c.id, peer)))
-      throw new AppError(409, "CONTACT_IGNORED");
+    // Signal retrieves media by message ID, without a recipient. These two operations
+    // do not send messages; allow them when this device has any effective overflow.
+    if (action === "setPresence" || action === "getBase64FromMediaMessage") {
+      if (!evolution.store.hasActiveOverflow(c.id)) throw new AppError(409, "OVERFLOW_DISABLED");
+    } else {
+      if (!peers.length || peers.some((peer) => !isPerson(peer)))
+        throw new AppError(400, "INVALID_RECIPIENT");
+      for (const peer of peers) {
+        const policy = evolution.store.contactPolicy(c, peer);
+        if (policy.reason) throw new AppError(409, policy.reason);
+      }
+    }
   }
   try {
     const response = await evolution.request(

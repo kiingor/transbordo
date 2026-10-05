@@ -61,6 +61,7 @@ type Connection = {
   last_sync: number | null;
   contacts: number;
   ignored: number;
+  individual: number;
   pending: number;
   failed: number;
 };
@@ -70,7 +71,13 @@ type Integration = {
   apiKey?: string;
   signalConfigured?: boolean;
 };
-type Contact = { jid: string; name: string; phone: string | null; ignored: number };
+type Contact = {
+  jid: string;
+  name: string;
+  phone: string | null;
+  ignored: number;
+  overflow: number;
+};
 type Delivery = {
   id: string;
   name: string;
@@ -97,7 +104,8 @@ const errors: Record<string, string> = {
   PLATFORM_INTEGRATION_REQUIRED: "Configure o Signal na conexão única da plataforma.",
   EVOLUTION_INVALID_PROFILE: "A Evolution ainda não disponibilizou o perfil do dispositivo.",
   EVOLUTION_PROFILE_NOT_FOUND: "Conecte o WhatsApp antes de sincronizar o perfil.",
-  PAUSE_BEFORE_CHANGING_WEBHOOK: "Pause o transbordo antes de alterar o destino.",
+  PAUSE_BEFORE_CHANGING_WEBHOOK:
+    "Desative o transbordo geral e as ativações individuais antes de alterar o destino.",
   ALREADY_EXISTS: "Essa instância ou esse e-mail já está cadastrado.",
   EVOLUTION_HTTP_401: "A Evolution recusou a chave. Confira as credenciais da instância.",
   EVOLUTION_HTTP_403: "A chave não tem acesso a essa instância Evolution.",
@@ -142,6 +150,10 @@ const stateLabel = (state: string) =>
     : state === "connecting"
       ? "Conectando"
       : "Aguardando conexão";
+const individualLabel = (count: number) =>
+  count > 0
+    ? `${count} ${count === 1 ? "contato ativado" : "contatos ativados"} individualmente`
+    : "Nenhum contato em transbordo";
 const initials = (name: string) =>
   name
     .split(" ")
@@ -440,7 +452,7 @@ function App() {
     );
   if (!user) return <Login done={setUser} />;
   const current = connections.find((c) => c.id === selected);
-  const active = connections.filter((c) => c.overflow).length;
+  const active = connections.filter((c) => c.overflow || c.individual > 0).length;
   const title = tab === "activity" ? "Atividade" : tab === "team" ? "Equipe" : "Dispositivos";
   return (
     <FeedbackContext.Provider value={notice?.error ? notice.text : ""}>
@@ -477,7 +489,9 @@ function App() {
           <div className="sidebar-tip">
             <CircleHelp size={19} />
             <strong>Você decide quando.</strong>
-            <p>Com o transbordo pausado, as novas mensagens ficam no WhatsApp.</p>
+            <p>
+              Ative contatos individualmente ou ligue o geral. Contatos ignorados ficam no WhatsApp.
+            </p>
           </div>
           <div className="profile">
             <button
@@ -675,11 +689,13 @@ function App() {
                           </span>
                           <div className={`overflow-control ${c.overflow ? "enabled" : ""}`}>
                             <div>
-                              <strong>Transbordo {c.overflow ? "ativo" : "pausado"}</strong>
+                              <strong>
+                                Transbordo geral {c.overflow ? "ligado" : "desligado"}
+                              </strong>
                               <small>
                                 {c.overflow
-                                  ? "Encaminhando para o Signal"
-                                  : "Mensagens ficam no WhatsApp"}
+                                  ? "Todos, exceto os ignorados"
+                                  : individualLabel(c.individual)}
                               </small>
                             </div>
                             <Toggle
@@ -978,7 +994,11 @@ function PlatformIntegration({
             <button className="primary" disabled={!!busy || active > 0}>
               {busy === "platform" ? <Spinner /> : <Link2 size={15} />} Salvar conexão da plataforma
             </button>
-            {active > 0 && <small>Pause todos os dispositivos antes de alterar a conexão.</small>}
+            {active > 0 && (
+              <small>
+                Desative o transbordo geral e as ativações individuais antes de alterar a conexão.
+              </small>
+            )}
           </form>
         </details>
       )}
@@ -1030,12 +1050,15 @@ function ConnectionDetail({
         </div>
         <div className="detail-toggle">
           <span>
-            Transbordo <b>{c.overflow ? "ativo" : "pausado"}</b>
+            Transbordo geral <b>{c.overflow ? "ligado" : "desligado"}</b>
+            <small>
+              {c.overflow ? "Todos, exceto os ignorados" : individualLabel(c.individual)}
+            </small>
           </span>
           <Toggle
             on={!!c.overflow}
             disabled={!!busy}
-            label="Ativar transbordo"
+            label="Ativar transbordo geral"
             action={() =>
               void run("overflow", async () => {
                 await api(`/connections/${c.id}`, { overflow: !c.overflow }, "PATCH");
@@ -1176,8 +1199,8 @@ function ConnectionDetail({
               : "A instância existente na Evolution será mantida. Apenas o webhook deste portal será desativado."}
           </p>
           <p>
-            O transbordo será pausado ao confirmar. Envios já em andamento podem terminar antes da
-            remoção.
+            O transbordo geral e as ativações individuais serão desligados ao confirmar. Envios já
+            em andamento podem terminar antes da remoção.
           </p>
           <div className="button-row">
             <button className="secondary" disabled={!!busy} onClick={() => setRemoveOpen(false)}>
@@ -1227,7 +1250,7 @@ function Contacts({
     [loading, setLoading] = useState(true);
   const refresh = useCallback(async () => {
     const r = await api<{ contacts: Contact[]; total: number }>(
-      `/connections/${c.id}/contacts?search=${encodeURIComponent(search)}&ignored=${filter}&page=${page}`,
+      `/connections/${c.id}/contacts?search=${encodeURIComponent(search)}&ignored=${filter === "individual" ? "all" : filter}&overflow=${filter === "individual" ? "true" : "all"}&page=${page}`,
     );
     setContacts(r.contacts);
     setTotal(r.total);
@@ -1251,7 +1274,7 @@ function Contacts({
       <div className="section-heading">
         <div>
           <h2>Quem pode chegar ao Signal?</h2>
-          <p>Contatos ignorados continuam no WhatsApp, mesmo com o transbordo ativo.</p>
+          <p>Ative só quem você escolher, mesmo com o transbordo geral desligado.</p>
         </div>
         <div className="button-row">
           <button className="secondary" onClick={() => setAdd(true)}>
@@ -1275,6 +1298,11 @@ function Contacts({
           </button>
         </div>
       </div>
+      <p className="contact-rule">
+        <strong>Ativação individual</strong> mantém o contato em transbordo sem ligar o geral. Com o
+        geral ligado, todos entram; use <strong>Ignorar</strong> para impedir um contato em qualquer
+        modo. Só novas mensagens são encaminhadas.
+      </p>
       <div className="contact-tools">
         <div className="search">
           <Search size={16} />
@@ -1298,7 +1326,8 @@ function Contacts({
         >
           <option value="all">Todos os contatos</option>
           <option value="true">Ignorados</option>
-          <option value="false">Permitidos</option>
+          <option value="false">Não ignorados</option>
+          <option value="individual">Ativação individual ligada</option>
         </select>
         <small>Última sincronização: {date(c.last_sync)}</small>
       </div>
@@ -1323,12 +1352,13 @@ function Contacts({
         />
       ) : (
         <div className="table-wrap">
-          <table>
+          <table className="contacts-table">
             <thead>
               <tr>
                 <th>Contato</th>
                 <th>Número</th>
                 <th>Encaminhamento</th>
+                <th>Ativação individual</th>
                 <th>Ignorar</th>
               </tr>
             </thead>
@@ -1342,12 +1372,37 @@ function Contacts({
                     </div>
                   </td>
                   <td>{contact.phone ? `+${contact.phone}` : contact.jid}</td>
-                  <td>
-                    <span className={`badge ${contact.ignored ? "neutral" : "green"}`}>
-                      {contact.ignored ? "Ignorado" : "Permitido"}
+                  <td data-label="Encaminhamento">
+                    <span
+                      className={`badge ${!contact.ignored && (c.overflow || contact.overflow) ? "green" : "neutral"}`}
+                    >
+                      {contact.ignored
+                        ? "Ignorado"
+                        : contact.overflow
+                          ? "Ativo · individual"
+                          : c.overflow
+                            ? "Ativo · geral"
+                            : "Desativado"}
                     </span>
                   </td>
-                  <td>
+                  <td data-label="Ativação individual">
+                    <Toggle
+                      on={!!contact.overflow}
+                      disabled={!!busy}
+                      label={`Ativar transbordo de ${contact.name || contact.phone || contact.jid}`}
+                      action={() =>
+                        void run("contact", async () => {
+                          await api(
+                            `/connections/${c.id}/contacts`,
+                            { jid: contact.jid, overflow: !contact.overflow },
+                            "PATCH",
+                          );
+                          await refresh();
+                        })
+                      }
+                    />
+                  </td>
+                  <td data-label="Ignorar">
                     <Toggle
                       on={!!contact.ignored}
                       disabled={!!busy}
@@ -1451,8 +1506,10 @@ const reasonNames: Record<string, string> = {
   DEVICE_REMOVED: "Remoção do dispositivo",
 };
 const auditNames: Record<string, string> = {
-  "overflow.enabled": "Ativou o transbordo",
-  "overflow.disabled": "Pausou o transbordo",
+  "overflow.enabled": "Ativou o transbordo geral",
+  "overflow.disabled": "Desativou o transbordo geral",
+  "contact.overflow_enabled": "Ativou o transbordo individual de um contato",
+  "contact.overflow_disabled": "Desativou o transbordo individual de um contato",
   "contact.ignored": "Ignorou um contato",
   "contact.allowed": "Liberou um contato",
   "contacts.synced": "Sincronizou contatos",

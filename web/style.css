@@ -1063,6 +1063,19 @@ footer span {
   border-top: 1px solid var(--line);
   flex-wrap: wrap;
 }
+.contact-rule {
+  color: #637d8d;
+  font-size: 12px;
+  line-height: 1.7;
+  margin: 0 0 18px;
+  max-width: 780px;
+}
+.detail-toggle small {
+  display: block;
+  font-size: 10px;
+  margin-top: 5px;
+  color: #748b9a;
+}
 .contact-tools select {
   font-size: 11px;
   width: auto;
@@ -1392,6 +1405,35 @@ td strong {
   }
   .contact-tools select {
     width: 100%;
+  }
+  .contacts-table thead {
+    display: none;
+  }
+  .contacts-table tbody,
+  .contacts-table tr,
+  .contacts-table td {
+    display: block;
+  }
+  .contacts-table tr {
+    padding: 14px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .contacts-table td {
+    border: 0;
+    padding: 6px 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .contacts-table td[data-label] {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .contacts-table td[data-label]::before {
+    content: attr(data-label);
+    color: #486274;
+    font-size: 11px;
   }
   .button-row {
     gap: 7px;

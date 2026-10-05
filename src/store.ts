@@ -51,6 +51,8 @@ export interface Contact {
   name: string;
   phone: string | null;
   ignored: number;
+  overflow: number;
+  enabled_at: number | null;
   updated_at: number;
 }
 export interface Delivery {
@@ -76,7 +78,8 @@ export class Store {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     this.vault = new Vault(Buffer.from(key, "base64"));
-    if (Number(this.db.prepare("PRAGMA user_version").get()?.user_version) > 2) {
+    const version = Number(this.db.prepare("PRAGMA user_version").get()?.user_version);
+    if (version > 3) {
       this.db.close();
       throw new Error("DATABASE_VERSION_UNSUPPORTED");
     }
@@ -129,13 +132,19 @@ export class Store {
       })) {
         if (!columns.has(name)) this.db.exec(`ALTER TABLE connections ADD COLUMN ${name} ${type}`);
       }
+      if (version < 3) {
+        this.db.exec(`ALTER TABLE contacts ADD COLUMN overflow INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE contacts ADD COLUMN enabled_at INTEGER;
+          UPDATE contacts SET enabled_at=(SELECT enabled_at FROM connections
+            WHERE id=contacts.connection_id AND overflow=1) WHERE ignored=0;`);
+      }
       if (!this.db.prepare("SELECT 1 FROM platform WHERE singleton=1").get()) {
         const id = randomUUID();
         this.db
           .prepare("INSERT INTO platform(singleton,id,secrets) VALUES(1,?,?)")
           .run(id, this.vault.seal({ apiKey: token() }, `platform:${id}`));
       }
-      this.db.exec("PRAGMA user_version=2");
+      this.db.exec("PRAGMA user_version=3");
     });
   }
   platform(): Platform {
@@ -152,8 +161,7 @@ export class Store {
     this.transaction(() => {
       const platform = this.platform();
       if (platform.signalUrl === signalUrl) return;
-      if (this.db.prepare("SELECT 1 FROM connections WHERE overflow=1 LIMIT 1").get())
-        throw new AppError(409, "PAUSE_BEFORE_CHANGING_WEBHOOK");
+      if (this.hasActiveOverflow()) throw new AppError(409, "PAUSE_BEFORE_CHANGING_WEBHOOK");
       this.db
         .prepare("UPDATE platform SET secrets=?,revision=revision+1 WHERE singleton=1")
         .run(this.vault.seal({ apiKey: platform.apiKey, signalUrl }, `platform:${platform.id}`));
@@ -240,6 +248,9 @@ export class Store {
   beginRemoval(id: string, actor: string): Connection {
     const c = this.connection(id);
     this.transaction(() => {
+      this.db
+        .prepare("UPDATE contacts SET overflow=0,enabled_at=NULL WHERE connection_id=?")
+        .run(id);
       this.setOverflow(id, false, actor);
       this.db
         .prepare(`UPDATE deliveries SET status='ignored',payload=NULL,last_error='DEVICE_REMOVED'
@@ -301,6 +312,7 @@ export class Store {
       c.profile_name,c.profile_synced_at,(c.profile_photo IS NOT NULL) AS has_photo,
       (SELECT count(*) FROM contacts WHERE connection_id=c.id) AS contacts,
       (SELECT count(*) FROM contacts WHERE connection_id=c.id AND ignored=1) AS ignored,
+      (SELECT count(*) FROM contacts WHERE connection_id=c.id AND overflow=1 AND ignored=0) AS individual,
       (SELECT count(*) FROM deliveries WHERE connection_id=c.id AND status IN ('pending','processing')) AS pending,
       (SELECT count(*) FROM deliveries WHERE connection_id=c.id AND status='failed') AS failed
       FROM connections c ORDER BY c.created_at DESC`)
@@ -311,25 +323,32 @@ export class Store {
       const c = this.connection(id);
       if (enabled && (!this.signalUrl(c) || !c.webhook_configured))
         throw new AppError(409, "CONNECTION_SETUP_REQUIRED");
+      const now = Math.floor(Date.now() / 1000) * 1000;
       this.db
         .prepare("UPDATE connections SET overflow=?,enabled_at=? WHERE id=?")
-        .run(
-          enabled ? 1 : 0,
-          enabled && !c.overflow ? Math.floor(Date.now() / 1000) * 1000 : c.enabled_at,
-          id,
-        );
+        .run(enabled ? 1 : 0, enabled && !c.overflow ? now : c.enabled_at, id);
+      if (enabled && !c.overflow) {
+        this.db
+          .prepare(
+            "UPDATE contacts SET enabled_at=? WHERE connection_id=? AND ignored=0 AND enabled_at IS NULL",
+          )
+          .run(now, id);
+      }
       if (!enabled) {
         this.db
-          .prepare(`UPDATE deliveries SET status='ignored',payload=NULL,last_error='OVERFLOW_DISABLED'
-          WHERE connection_id=? AND status='pending' AND event<>'DEVICE_UPDATE'`)
+          .prepare("UPDATE contacts SET enabled_at=NULL WHERE connection_id=? AND overflow=0")
           .run(id);
-        this.db
-          .prepare(`UPDATE deliveries SET last_error='OVERFLOW_DISABLED'
-          WHERE connection_id=? AND status='processing' AND event<>'DEVICE_UPDATE'`)
-          .run(id);
+        this.cancelBlockedDeliveries(id);
       }
       this.audit(actor, enabled ? "overflow.enabled" : "overflow.disabled", id);
     });
+  }
+  hasActiveOverflow(id?: string): boolean {
+    return !!this.db
+      .prepare(`SELECT 1 FROM connections c WHERE
+      (c.overflow=1 OR EXISTS(SELECT 1 FROM contacts WHERE connection_id=c.id AND overflow=1 AND ignored=0))
+      ${id ? "AND c.id=?" : ""} LIMIT 1`)
+      .get(...(id ? [id] : []));
   }
   canonical(id: string, jid: string): string {
     const row = this.db
@@ -338,52 +357,134 @@ export class Store {
     return row?.canonical ?? jid;
   }
   linkAlias(id: string, alias: string, canonical: string) {
-    if (alias === canonical) return;
-    this.db
-      .prepare(
-        `INSERT INTO aliases VALUES(?,?,?) ON CONFLICT(connection_id,alias) DO UPDATE SET canonical=excluded.canonical`,
-      )
-      .run(id, alias, canonical);
-    const old = this.db
-      .prepare("SELECT * FROM contacts WHERE connection_id=? AND jid=?")
-      .get(id, alias) as unknown as Contact | undefined;
-    if (old) {
-      this.upsertContact(id, canonical, old.name, old.phone);
-      if (old.ignored)
-        this.db
-          .prepare("UPDATE contacts SET ignored=1 WHERE connection_id=? AND jid=?")
-          .run(id, canonical);
-    }
+    if (alias === canonical || this.canonical(id, alias) === canonical) return;
+    const c = this.connection(id);
+    const previous = [this.contactPolicy(c, alias), this.contactPolicy(c, canonical)];
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO aliases VALUES(?,?,?) ON CONFLICT(connection_id,alias) DO UPDATE SET canonical=excluded.canonical`,
+        )
+        .run(id, alias, canonical);
+      const old = this.db
+        .prepare("SELECT * FROM contacts WHERE connection_id=? AND jid=?")
+        .get(id, alias) as unknown as Contact | undefined;
+      if (old) {
+        this.upsertContact(id, canonical, old.name, old.phone);
+      }
+      const ignored = previous.some((p) => p.ignored),
+        individual = previous.some((p) => p.individual);
+      const since = previous.filter((p) => p.enabled && p.since !== null).map((p) => p.since!);
+      this.writeContactPolicy(
+        id,
+        canonical,
+        ignored,
+        individual,
+        ignored || !since.length ? null : Math.max(...since),
+      );
+      if (ignored) this.cancelBlockedDeliveries(id);
+    });
   }
   upsertContact(id: string, jid: string, name: string, phone: string | null) {
+    jid = this.canonical(id, jid);
     this.db
-      .prepare(`INSERT INTO contacts VALUES(?,?,?,?,0,?) ON CONFLICT(connection_id,jid) DO UPDATE SET
+      .prepare(`INSERT INTO contacts(connection_id,jid,name,phone,updated_at,enabled_at)
+      VALUES(?,?,?,?,?,(SELECT CASE WHEN overflow=1 THEN enabled_at END FROM connections WHERE id=?))
+      ON CONFLICT(connection_id,jid) DO UPDATE SET
       name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE contacts.name END,
       phone=COALESCE(excluded.phone,contacts.phone),updated_at=excluded.updated_at`)
-      .run(id, jid, name, phone, Date.now());
+      .run(id, jid, name, phone, Date.now(), id);
+  }
+  contactPolicy(c: Connection, peer: string) {
+    const canonical = this.canonical(c.id, peer);
+    const rows = this.db
+      .prepare(`SELECT ignored,overflow,enabled_at FROM contacts
+      WHERE connection_id=? AND (jid=? OR jid IN (SELECT alias FROM aliases WHERE connection_id=? AND canonical=?))`)
+      .all(c.id, canonical, c.id, canonical) as unknown as Pick<
+      Contact,
+      "ignored" | "overflow" | "enabled_at"
+    >[];
+    const ignored = rows.some((r) => !!r.ignored),
+      individual = rows.some((r) => !!r.overflow);
+    const enabled = !ignored && (!!c.overflow || individual);
+    const times = rows.map((r) => r.enabled_at).filter((time): time is number => time !== null);
+    const since = enabled ? (times.length ? Math.max(...times) : c.enabled_at) : null;
+    return {
+      enabled,
+      ignored,
+      individual,
+      since,
+      reason: ignored ? "CONTACT_IGNORED" : enabled ? undefined : "OVERFLOW_DISABLED",
+    };
   }
   isIgnored(id: string, peer: string): boolean {
-    const canonical = this.canonical(id, peer);
-    return !!this.db
-      .prepare("SELECT 1 FROM contacts WHERE connection_id=? AND jid IN (?,?) AND ignored=1")
-      .get(id, peer, canonical);
+    return this.contactPolicy(this.connection(id), peer).ignored;
+  }
+  private writeContactPolicy(
+    id: string,
+    canonical: string,
+    ignored: boolean,
+    individual: boolean,
+    since: number | null,
+  ) {
+    return this.db
+      .prepare(`UPDATE contacts SET ignored=?,overflow=?,enabled_at=? WHERE connection_id=?
+      AND (jid=? OR jid IN (SELECT alias FROM aliases WHERE connection_id=? AND canonical=?))`)
+      .run(ignored ? 1 : 0, individual ? 1 : 0, since, id, canonical, id, canonical);
+  }
+  private cancelBlockedDeliveries(id: string) {
+    const c = this.connection(id);
+    const jobs = this.db
+      .prepare(`SELECT id,peer FROM deliveries WHERE connection_id=?
+      AND status IN ('pending','processing') AND event<>'DEVICE_UPDATE'`)
+      .all(id);
+    const cancel = this.db.prepare(`UPDATE deliveries SET
+      status=CASE WHEN status='pending' THEN 'ignored' ELSE status END,
+      payload=CASE WHEN status='pending' THEN NULL ELSE payload END,last_error=? WHERE id=?`);
+    for (const job of jobs) {
+      const policy = this.contactPolicy(c, String(job.peer));
+      if (!policy.enabled) cancel.run(policy.reason!, String(job.id));
+    }
   }
   setIgnored(id: string, jid: string, ignored: boolean, actor: string) {
-    const canonical = this.canonical(id, jid);
+    this.setContactPolicy(id, jid, { ignored }, actor);
+  }
+  setContactPolicy(
+    id: string,
+    jid: string,
+    patch: { ignored?: boolean; overflow?: boolean },
+    actor: string,
+  ) {
     this.transaction(() => {
-      const changed = this.db
-        .prepare("UPDATE contacts SET ignored=? WHERE connection_id=? AND jid IN (?,?)")
-        .run(ignored ? 1 : 0, id, jid, canonical);
+      const c = this.connection(id),
+        previous = this.contactPolicy(c, jid);
+      if (patch.overflow && (!this.signalUrl(c) || !c.webhook_configured))
+        throw new AppError(409, "CONNECTION_SETUP_REQUIRED");
+      const ignored = patch.ignored ?? previous.ignored,
+        individual = patch.overflow ?? previous.individual;
+      const enabled = !ignored && (!!c.overflow || individual);
+      const since = enabled
+        ? previous.enabled
+          ? previous.since
+          : Math.floor(Date.now() / 1000) * 1000
+        : null;
+      const changed = this.writeContactPolicy(
+        id,
+        this.canonical(id, jid),
+        ignored,
+        individual,
+        since,
+      );
       if (!changed.changes) throw new AppError(404, "CONTACT_NOT_FOUND");
-      if (ignored)
-        this.db
-          .prepare(`UPDATE deliveries SET
-        status=CASE WHEN status='pending' THEN 'ignored' ELSE status END,
-        payload=CASE WHEN status='pending' THEN NULL ELSE payload END,last_error='CONTACT_IGNORED'
-        WHERE connection_id=? AND status IN ('pending','processing') AND (peer IN (?,?) OR peer IN
-          (SELECT alias FROM aliases WHERE connection_id=? AND canonical=?))`)
-          .run(id, jid, canonical, id, canonical);
-      this.audit(actor, ignored ? "contact.ignored" : "contact.allowed", id);
+      if (!enabled) this.cancelBlockedDeliveries(id);
+      if (patch.ignored !== undefined)
+        this.audit(actor, ignored ? "contact.ignored" : "contact.allowed", id);
+      if (patch.overflow !== undefined)
+        this.audit(
+          actor,
+          individual ? "contact.overflow_enabled" : "contact.overflow_disabled",
+          id,
+        );
     });
   }
   enqueue(

@@ -33,6 +33,7 @@ const newUser = loginSchema.extend({
 const pageSchema = z.object({
   search: z.string().max(150).default(""),
   ignored: z.enum(["all", "true", "false"]).default("all"),
+  overflow: z.enum(["all", "true", "false"]).default("all"),
   page: z.coerce.number().int().min(1).max(10000).default(1),
 });
 const safeUser = (u: User) => ({ id: u.id, name: u.name, email: u.email, role: u.role });
@@ -278,7 +279,8 @@ export async function buildApp(
           if (body.signalUrl !== undefined) {
             if (store.platform().signalUrl)
               throw new AppError(409, "PLATFORM_INTEGRATION_REQUIRED");
-            if (c.overflow) throw new AppError(409, "PAUSE_BEFORE_CHANGING_WEBHOOK");
+            if (store.hasActiveOverflow(c.id))
+              throw new AppError(409, "PAUSE_BEFORE_CHANGING_WEBHOOK");
             store.setSecrets(c, {
               ...store.secrets(c),
               signalUrl: validSignalUrl(body.signalUrl, config),
@@ -341,7 +343,7 @@ export async function buildApp(
     api.get<{ Params: { id: string } }>("/api/connections/:id/contacts", async (request) => {
       const c = store.connection(request.params.id),
         query = pageSchema.parse(request.query);
-      const clause = `connection_id=? AND (name LIKE ? ESCAPE '\\' OR jid LIKE ? ESCAPE '\\') ${query.ignored === "all" ? "" : `AND ignored=${query.ignored === "true" ? 1 : 0}`}`;
+      const clause = `connection_id=? AND (name LIKE ? ESCAPE '\\' OR jid LIKE ? ESCAPE '\\') ${query.ignored === "all" ? "" : `AND ignored=${query.ignored === "true" ? 1 : 0}`} ${query.overflow === "all" ? "" : `AND overflow=${query.overflow === "true" ? 1 : 0}`}`;
       const term = `%${query.search.replace(/[\\%_]/g, "\\$&")}%`;
       const rows = store.db
         .prepare(
@@ -379,10 +381,17 @@ export async function buildApp(
       const user = session(request),
         c = store.connection(request.params.id);
       const body = z
-        .object({ jid: z.string().max(100), ignored: z.boolean() })
+        .object({
+          jid: z.string().max(100),
+          ignored: z.boolean().optional(),
+          overflow: z.boolean().optional(),
+        })
         .strict()
+        .refine((v) => v.ignored !== undefined || v.overflow !== undefined)
         .parse(request.body);
-      store.setIgnored(c.id, normalizeJid(body.jid), body.ignored, user.id);
+      const jid = normalizeJid(body.jid);
+      if (!isPerson(jid)) throw new AppError(400, "INVALID_PHONE");
+      store.setContactPolicy(c.id, jid, body, user.id);
       return { ok: true };
     });
     api.get("/api/activity", async (request) => {
